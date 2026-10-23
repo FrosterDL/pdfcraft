@@ -695,6 +695,28 @@ fn days_in_month(y: u32, m: u32) -> u32 {
     }
 }
 
+fn is_valid_tz_offset(offset: &str) -> bool {
+    let Some(sign) = offset.chars().next() else { return false };
+    if sign != '+' && sign != '-' {
+        return false;
+    }
+    let rest = offset.get(1..).unwrap_or("");
+    let digits: String = rest.chars().filter(|c| *c != ':' && *c != '\'').collect();
+    if !digits.chars().all(|c| c.is_ascii_digit()) || !matches!(digits.len(), 2 | 4) {
+        return false;
+    }
+    let Some(h) = digits.get(0..2).and_then(|v| v.parse::<u32>().ok()) else { return false };
+    if h > 23 {
+        return false;
+    }
+    if let Some(m) = digits.get(2..4).and_then(|v| v.parse::<u32>().ok())
+        && m > 59
+    {
+        return false;
+    }
+    true
+}
+
 /// Validate whether an input string matches an acceptable date format:
 /// - Human 12-hour format: `MM/DD/YY, h:mm:ss AM/PM` (or `MM/DD/YYYY, h:mm:ss AM/PM`)
 /// - ISO format: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS`
@@ -802,7 +824,9 @@ pub fn is_valid_pdf_date_input(s: &str) -> bool {
             (n1, n2, n3)
         } else {
             // MM/DD/YY or MM/DD/YYYY
-            let full_year = if n3 < 70 {
+            let full_year = if n3_str.len() == 4 {
+                n3
+            } else if n3 < 70 {
                 2000u32.saturating_add(n3)
             } else if n3 < 100 {
                 1900u32.saturating_add(n3)
@@ -822,7 +846,10 @@ pub fn is_valid_pdf_date_input(s: &str) -> bool {
             if upper_part == "AM" || upper_part == "PM" || upper_part == "Z" {
                 continue;
             }
-            if (part.starts_with('+') || part.starts_with('-')) && part.len() >= 3 {
+            if part.starts_with('+') || part.starts_with('-') {
+                if !is_valid_tz_offset(part) {
+                    return false;
+                }
                 continue;
             }
             let cleaned = part.trim_end_matches(|c: char| c.is_ascii_alphabetic());
@@ -881,8 +908,16 @@ pub fn is_valid_pdf_date_input(s: &str) -> bool {
                 }
                 if let Some(time_part) = parts.get(1) {
                     let cleaned = time_part.trim_end_matches(|c: char| c == 'Z' || c == 'z' || c.is_ascii_alphabetic());
-                    let cleaned =
-                        if let Some(idx) = cleaned.find('+').or_else(|| cleaned.find('-')) { cleaned.get(..idx).unwrap_or(cleaned) } else { cleaned };
+                    let (cleaned, offset) = if let Some(idx) = cleaned.find('+').or_else(|| cleaned.find('-')) {
+                        (cleaned.get(..idx).unwrap_or(cleaned), cleaned.get(idx..))
+                    } else {
+                        (cleaned, None)
+                    };
+                    if let Some(off) = offset
+                        && !is_valid_tz_offset(off)
+                    {
+                        return false;
+                    }
                     let time_chunks: Vec<&str> = cleaned.split(':').collect();
                     if !time_chunks.is_empty() {
                         let Some(h_str) = time_chunks.first() else { return false };
@@ -909,8 +944,8 @@ pub fn is_valid_pdf_date_input(s: &str) -> bool {
         }
     }
 
-    // Pure digits: at least 4 digits for year
-    if s.chars().all(|c| c.is_ascii_digit()) && s.len() >= 4 && s.len() <= 14 {
+    // Pure digits: at least 4 digits for year, matching valid 2-digit field increments (4, 6, 8, 10, 12, 14)
+    if s.chars().all(|c| c.is_ascii_digit()) && matches!(s.len(), 4 | 6 | 8 | 10 | 12 | 14) {
         let Some(y_str) = s.get(0..4) else { return false };
         let Ok(y) = y_str.parse::<u32>() else { return false };
         if y == 0 {
@@ -1022,7 +1057,9 @@ pub fn normalize_pdf_date_with(s: &str, offset_secs: i64) -> String {
                 let (y, m, d) = if slash_parts[0].len() == 4 {
                     (n1, n2.clamp(1, 12), n3.clamp(1, 31))
                 } else {
-                    let full_year = if n3 < 70 {
+                    let full_year = if slash_parts.get(2).is_some_and(|s| s.len() == 4) {
+                        n3
+                    } else if n3 < 70 {
                         2000 + n3
                     } else if n3 < 100 {
                         1900 + n3

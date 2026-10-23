@@ -721,6 +721,23 @@ fn is_valid_pdf_date_input_checks_pattern_correctly() {
     assert!(is_valid_pdf_date_input("D:202610"));
     assert!(is_valid_pdf_date_input("D:20261020"));
 
+    // 4-digit year format preservation (e.g. 0085 vs 2-digit 85)
+    assert_eq!(normalize_pdf_date("1/1/0085, 12:00:00 PM Z"), "D:00850101120000Z");
+    assert_eq!(normalize_pdf_date("1/1/85, 12:00:00 PM Z"), "D:19850101120000Z");
+
+    // Pure digits
+    assert!(is_valid_pdf_date_input("2026"));
+    assert!(is_valid_pdf_date_input("202610"));
+    assert!(is_valid_pdf_date_input("20261020"));
+    assert!(!is_valid_pdf_date_input("20261")); // 5 digits (partial)
+    assert!(!is_valid_pdf_date_input("202610201")); // 9 digits (partial)
+
+    // Slash and ISO invalid timezone offsets:
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:16:49 PM +99:99"));
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:16:49 PM +03:60"));
+    assert!(!is_valid_pdf_date_input("2026-10-20 16:16:49+99:99"));
+    assert!(!is_valid_pdf_date_input("2026-10-20T16:16:49+03:60"));
+
     // Invalid formats:
     assert!(!is_valid_pdf_date_input("not-a-date"));
     assert!(!is_valid_pdf_date_input("random words"));
