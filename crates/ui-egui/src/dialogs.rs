@@ -7,7 +7,7 @@ use pdfcraft_engine::Edit;
 
 use crate::{CloseRequest, Dialog, PdfCraftApp, PropsTab, panels::human_size, widgets};
 
-const INFO_KEYS: [&str; 4] = ["Title", "Author", "Subject", "Keywords"];
+const INFO_KEYS: [&str; 6] = ["Title", "Author", "Subject", "Keywords", "CreationDate", "ModDate"];
 
 pub fn show(app: &mut PdfCraftApp, ctx: &egui::Context) {
     dialogs(app, ctx);
@@ -25,6 +25,14 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     if app.dialog != Some(Dialog::WordCount) {
         app.word_count_draft.cancel();
     }
+    if app.dialog != Some(Dialog::FieldTable) {
+        app.field_table_draft = None;
+    }
+    // A movable window, not this modal: the page under it shows the table as it changes.
+    if app.dialog == Some(Dialog::FieldTable) {
+        crate::field_table_ui::show(app, ctx);
+        return;
+    }
     let Some(dialog) = app.dialog else {
         app.props_draft = None;
         app.view_draft = None;
@@ -39,7 +47,13 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
         && app.props_draft.as_ref().is_none_or(|(d, _)| *d != id)
         && let Some(doc) = app.session.get(id)
     {
-        app.props_draft = Some((id, INFO_KEYS.map(|k| doc.info_value(k).unwrap_or_default())));
+        app.props_draft = Some((
+            id,
+            INFO_KEYS.map(|k| {
+                let val = doc.info_value(k).unwrap_or_default();
+                if k == "CreationDate" || k == "ModDate" { pdfcraft_engine::format_pdf_date(&val) } else { val }
+            }),
+        ));
         app.view_draft = Some((id, doc.initial_view()));
     }
     let mut apply = false;
@@ -136,9 +150,32 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                             match app.props_draft.as_mut() {
                                 Some((_, draft)) if doc.allows_modification() => {
                                     for (k, v) in INFO_KEYS.iter().zip(draft.iter_mut()) {
-                                        let l = ui.label(egui::RichText::new(tl!(k)).color(t.text_muted));
-                                        ui.add(widgets::line(v).desired_width(420.0).background_color(t.field).id_salt(("info", *k)))
-                                            .labelled_by(l.id);
+                                        let label = match *k {
+                                            "CreationDate" => tl!("Created"),
+                                            "ModDate" => tl!("Modified"),
+                                            other => tl!(other),
+                                        };
+                                        let l = ui.label(egui::RichText::new(label).color(t.text_muted));
+                                        let is_date = *k == "CreationDate" || *k == "ModDate";
+                                        let seeded = if is_date {
+                                            doc.info_value(k).map(|e| pdfcraft_engine::format_pdf_date(&e)).unwrap_or_default()
+                                        } else {
+                                            String::new()
+                                        };
+                                        let is_err = is_date && v.trim() != seeded && !pdfcraft_engine::is_valid_pdf_date_input(v);
+                                        ui.vertical(|ui| {
+                                            ui.add(widgets::line(v).desired_width(420.0).background_color(t.field).id_salt(("info", *k)))
+                                                .labelled_by(l.id);
+                                            if is_err {
+                                                ui.label(
+                                                    egui::RichText::new(tl!(
+                                                        "Please follow pattern: MM/DD/YY, h:mm:ss AM/PM (e.g. 10/20/26, 4:16:49 PM)"
+                                                    ))
+                                                    .color(egui::Color32::from_rgb(220, 60, 60))
+                                                    .small(),
+                                                );
+                                            }
+                                        });
                                         ui.end_row();
                                     }
                                 }
@@ -147,6 +184,8 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                                     row(ui, "Author", i.author.clone().unwrap_or_default());
                                     row(ui, "Subject", i.subject.clone().unwrap_or_default());
                                     row(ui, "Keywords", i.keywords.clone().unwrap_or_default());
+                                    row(ui, "Created", i.creation_date.as_deref().map(pdfcraft_engine::format_pdf_date).unwrap_or_default());
+                                    row(ui, "Modified", i.mod_date.as_deref().map(pdfcraft_engine::format_pdf_date).unwrap_or_default());
                                 }
                             }
                             row(ui, "Application", i.creator.clone().unwrap_or_default());
@@ -719,6 +758,9 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                 });
                 return;
             }
+            // Never reached: `dialogs` shows this movable window above and returns before the modal.
+            // The arm keeps the match exhaustive.
+            Dialog::FieldTable => close = true,
             Dialog::Optimize => {
                 let (ok, cancel) = crate::optimize_ui::body(ui, &mut app.optimize_draft, &t);
                 optimize_now = ok;
@@ -964,8 +1006,19 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
             }
             Dialog::Preferences => {
                 // The settings outgrow a short window: scroll them rather than run off the screen.
-                let max = (ui.ctx().content_rect().height() - 120.0).max(200.0);
-                close = egui::ScrollArea::vertical().max_height(max).show(ui, |ui| crate::js_ui::preferences_body(ui, app, &t)).inner;
+                // The OK row stays below the scroll, in reach however far the settings are scrolled.
+                let max = (ui.ctx().content_rect().height() - 120.0 - crate::js_ui::PREFERENCES_BUTTON_ROW).max(crate::js_ui::PREFERENCES_MIN_SCROLL);
+                // A scroll area starts from the room the dialog offers it, and a modal offers more
+                // each frame for the first few, so with OK outside the scroll the dialog would grow
+                // over those frames. Asking for the full height as the least it may scroll in
+                // (which only applies when the settings overflow it) opens the dialog at full size.
+                // A scrollbar of its own: the floating one lies over the right edge of the theme
+                // cards and other full-width rows (#3557).
+                ui.scope(|ui| {
+                    ui.spacing_mut().scroll.floating = false;
+                    egui::ScrollArea::vertical().max_height(max).min_scrolled_height(max).show(ui, |ui| crate::js_ui::preferences_body(ui, app, &t));
+                });
+                close = crate::js_ui::preferences_buttons(ui);
                 return;
             }
             Dialog::RecognizeText => {
@@ -1212,7 +1265,14 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
                     close = true;
                 }
             } else if changed {
-                if widgets::pill_button(ui, tl!("OK"), true).clicked() {
+                let has_error = app.props_draft.as_ref().is_some_and(|(id, draft)| {
+                    let doc = app.session.get(*id);
+                    INFO_KEYS.iter().zip(draft.iter()).any(|(k, v)| {
+                        let seeded = doc.and_then(|d| d.info_value(k)).map(|e| pdfcraft_engine::format_pdf_date(&e)).unwrap_or_default();
+                        (*k == "CreationDate" || *k == "ModDate") && v.trim() != seeded && !pdfcraft_engine::is_valid_pdf_date_input(v)
+                    })
+                });
+                if ui.add_enabled_ui(!has_error, |ui| widgets::pill_button(ui, tl!("OK"), true)).inner.clicked() {
                     apply = true;
                     close = true;
                 }
@@ -1330,12 +1390,29 @@ fn dialogs(app: &mut PdfCraftApp, ctx: &egui::Context) {
     if field_props_now
         && let Some(d) = app.field_props.take()
         && let Some(props) = d.props()
-        && app.apply_edit(Edit::SetFieldProps { name: d.field.clone(), props: Box::new(props) })
-        && let Some(i) = app.active
     {
-        // Keep the (possibly renamed) field selected.
-        let prefix = d.field.rsplit_once('.').map(|(p, _)| format!("{p}.")).unwrap_or_default();
-        app.views[i].prepare.selected = Some((format!("{prefix}{}", d.name.trim()), d.widget));
+        let form = |app: &PdfCraftApp| app.active_ids().and_then(|(_, id)| app.session.get(id)).map(|doc| doc.form.clone());
+        // A rename also renames the field in the formulas that read it.
+        let before = props.name.as_ref().and_then(|_| form(app));
+        if app.apply_edit(Edit::SetFieldProps { name: d.field.clone(), props: Box::new(props) })
+            && let Some(i) = app.active
+        {
+            // Keep the (possibly renamed) field selected.
+            let prefix = d.field.rsplit_once('.').map(|(p, _)| format!("{p}.")).unwrap_or_default();
+            let name = format!("{prefix}{}", d.name.trim());
+            if let (Some(before), Some(after)) = (before, form(app)) {
+                let n = pdfcraft_engine::form_calculations_changed(&before, &after).iter().filter(|f| **f != name).count();
+                if n > 0 {
+                    app.notify(crate::i18n::trn(
+                        crate::i18n::current(),
+                        n as u64,
+                        "{n} calculation now uses the new name.",
+                        "{n} calculations now use the new name.",
+                    ));
+                }
+            }
+            app.views[i].prepare.selected = Some((name, d.widget));
+        }
     }
     if props_now && let Some(d) = app.comment_props.take() {
         let mut edits = crate::comment_props::edits(&d);
@@ -1428,7 +1505,20 @@ fn draft_changes(app: &PdfCraftApp) -> Option<Vec<Edit>> {
     let mut edits: Vec<Edit> = INFO_KEYS
         .iter()
         .zip(draft.iter())
-        .filter(|(k, v)| doc.info_value(k).unwrap_or_default().trim() != v.trim())
+        .filter(|(k, v)| {
+            let existing = doc.info_value(k).unwrap_or_default();
+            if **k == "CreationDate" || **k == "ModDate" {
+                let v_trimmed = v.trim();
+                if v_trimmed.is_empty() {
+                    !existing.is_empty()
+                } else {
+                    let formatted_existing = pdfcraft_engine::format_pdf_date(&existing);
+                    if formatted_existing == v_trimmed { false } else { pdfcraft_engine::normalize_pdf_date(v_trimmed) != existing }
+                }
+            } else {
+                existing.trim() != v.trim()
+            }
+        })
         .map(|(k, v)| Edit::SetInfo { key: (*k).to_string(), value: v.clone() })
         .collect();
     if let Some((vid, v)) = &app.view_draft
@@ -1440,21 +1530,74 @@ fn draft_changes(app: &PdfCraftApp) -> Option<Vec<Edit>> {
     Some(edits)
 }
 
-/// The "Save changes?" prompt's keys (issue #8), read before anything else can take them: Enter
-/// saves (the default button) and Escape cancels; Don't save takes ⌘D / Ctrl+D, the macOS
-/// convention, or Alt+D / Alt+N, the mnemonics Windows and Linux desktops use for it.
-pub(crate) fn save_prompt_key(ctx: &egui::Context) -> Option<Option<bool>> {
+/// The buttons of the "Save changes?" prompt, in the order they sit on screen, left to right.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PromptButton {
+    DontSave,
+    Cancel,
+    #[default]
+    Save,
+}
+
+impl PromptButton {
+    const ORDER: [PromptButton; 3] = [PromptButton::DontSave, PromptButton::Cancel, PromptButton::Save];
+
+    fn position(self) -> usize {
+        Self::ORDER.iter().position(|b| *b == self).unwrap_or(2)
+    }
+
+    /// The button `by` places to the right (negative: left). Arrow keys stop at the ends.
+    fn step(self, by: isize) -> PromptButton {
+        let to = self.position().saturating_add_signed(by).min(Self::ORDER.len() - 1);
+        Self::ORDER.get(to).copied().unwrap_or(self)
+    }
+
+    /// The button after (or, with `back`, before) this one, wrapping round: Tab and Shift+Tab.
+    fn cycle(self, back: bool) -> PromptButton {
+        let n = Self::ORDER.len();
+        let to = if back { self.position().checked_sub(1).unwrap_or(n - 1) } else { (self.position() + 1) % n };
+        Self::ORDER.get(to).copied().unwrap_or(self)
+    }
+
+    /// What pressing the button answers.
+    fn answer(self) -> Option<bool> {
+        match self {
+            PromptButton::Save => Some(true),
+            PromptButton::DontSave => Some(false),
+            PromptButton::Cancel => None,
+        }
+    }
+}
+
+/// The "Save changes?" prompt's keys (issue #8), read before anything else can take them. Save is
+/// the button chosen when the prompt opens, so Enter saves; the arrow keys and Tab / Shift+Tab move
+/// the choice, and Enter or Space press the chosen button. Escape cancels. Don't save also has
+/// ⌘D / Ctrl+D, the macOS convention, and Alt+D / Alt+N, the mnemonics Windows and Linux desktops
+/// use for it. Returns the answer once one is given.
+pub(crate) fn save_prompt_key(ctx: &egui::Context, chosen: &mut PromptButton) -> Option<Option<bool>> {
     use egui::{Key, Modifiers};
     ctx.input_mut(|i| {
-        if i.consume_key(Modifiers::NONE, Key::Enter) {
-            Some(Some(true))
-        } else if i.consume_key(Modifiers::NONE, Key::Escape) {
-            Some(None)
-        } else if [(Modifiers::COMMAND, Key::D), (Modifiers::ALT, Key::D), (Modifiers::ALT, Key::N)].into_iter().any(|(m, k)| i.consume_key(m, k)) {
-            Some(Some(false))
-        } else {
-            None
+        if i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Space) {
+            return Some(chosen.answer());
         }
+        if i.consume_key(Modifiers::NONE, Key::Escape) {
+            return Some(None);
+        }
+        if [(Modifiers::COMMAND, Key::D), (Modifiers::ALT, Key::D), (Modifiers::ALT, Key::N)].into_iter().any(|(m, k)| i.consume_key(m, k)) {
+            return Some(Some(false));
+        }
+        // Shift+Tab before Tab: a key press matches a pattern that asks for fewer modifiers.
+        if i.consume_key(Modifiers::SHIFT, Key::Tab) {
+            *chosen = chosen.cycle(true);
+        } else if i.consume_key(Modifiers::NONE, Key::Tab) {
+            *chosen = chosen.cycle(false);
+        }
+        for (key, by) in [(Key::ArrowLeft, -1), (Key::ArrowUp, -1), (Key::ArrowRight, 1), (Key::ArrowDown, 1)] {
+            if i.consume_key(Modifiers::NONE, key) {
+                *chosen = chosen.step(by);
+            }
+        }
+        None
     })
 }
 
@@ -1494,14 +1637,15 @@ fn save_prompt(app: &mut PdfCraftApp, ctx: &egui::Context) {
         ui.label(egui::RichText::new(tl!("Your changes will be lost if you don't save them.")).color(t.text_muted));
         ui.add_space(14.0);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if widgets::pill_button(ui, tl!("Save"), true).clicked() {
+            let chosen = app.save_prompt_button;
+            if widgets::pill_button_marked(ui, tl!("Save"), true, chosen == PromptButton::Save).clicked() {
                 choice = Some(Some(true));
             }
-            if widgets::pill_button(ui, tl!("Cancel"), false).clicked() {
+            if widgets::pill_button_marked(ui, tl!("Cancel"), false, chosen == PromptButton::Cancel).clicked() {
                 choice = Some(None);
             }
             ui.add_space(24.0);
-            if widgets::pill_button(ui, tl!("Don't save"), false).clicked() {
+            if widgets::pill_button_marked(ui, tl!("Don't save"), false, chosen == PromptButton::DontSave).clicked() {
                 choice = Some(Some(false));
             }
         });
@@ -1698,12 +1842,16 @@ fn password_modal(
         ui.add(egui::Label::new(message).wrap());
         ui.add_space(8.0);
         let r = ui.add(widgets::line(input).password(true).hint_text(tl!("Password")).desired_width(f32::INFINITY));
-        // Enter submits. The field keeps focus (we request it every frame), so check the key
-        // while it is focused as well as on the frame focus is lost.
+        // Enter submits. The field keeps focus, so check the key while it is focused as well as
+        // on the frame focus is lost.
         if (r.has_focus() || r.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             answer = Some(PasswordAnswer::Submit);
         }
-        r.request_focus();
+        // Only when it lost focus: each request interrupts the input method, and on Linux typed
+        // keys go through it, so asking on every frame lost everything typed (#2818).
+        if !r.has_focus() {
+            r.request_focus();
+        }
         if let Some(e) = error {
             ui.add_space(4.0);
             // Known error text is translated; anything else passes through.
@@ -1748,5 +1896,36 @@ fn unlock(app: &mut PdfCraftApp, ctx: &egui::Context) {
         }
         Some(PasswordAnswer::Cancel) => app.submit_unlock(None),
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod prompt_button_tests {
+    use super::PromptButton::{self, Cancel, DontSave, Save};
+
+    #[test]
+    fn opens_on_save_and_arrows_stop_at_the_ends() {
+        assert_eq!(PromptButton::default(), Save);
+        assert_eq!(Save.step(1), Save);
+        assert_eq!(Save.step(-1), Cancel);
+        assert_eq!(Cancel.step(-1), DontSave);
+        assert_eq!(DontSave.step(-1), DontSave);
+        assert_eq!(DontSave.step(1000), Save, "a long step clamps");
+        assert_eq!(Save.step(isize::MIN), DontSave, "and so does a huge negative one");
+    }
+
+    #[test]
+    fn tab_wraps_both_ways() {
+        assert_eq!(Save.cycle(false), DontSave);
+        assert_eq!(DontSave.cycle(true), Save);
+        assert_eq!(Cancel.cycle(false), Save);
+        assert_eq!(Cancel.cycle(true), DontSave);
+    }
+
+    #[test]
+    fn each_button_answers_as_labelled() {
+        assert_eq!(Save.answer(), Some(true));
+        assert_eq!(DontSave.answer(), Some(false));
+        assert_eq!(Cancel.answer(), None);
     }
 }

@@ -203,6 +203,119 @@ fn delete_keeps_inherited_attributes_on_survivors() {
 }
 
 #[test]
+fn deleting_a_page_prunes_deep_named_destination_trees() {
+    let mut doc = doc_a();
+    let original_pages = pages(&doc).unwrap();
+    let mut leaf = Dict::new();
+    leaf.set(
+        b"Names".to_vec(),
+        Object::Array(vec![
+            Object::String(PdfString::text("gone")),
+            Object::Array(vec![Object::Ref(original_pages[0].obj), Object::name("Fit")]),
+            Object::String(PdfString::text("kept")),
+            Object::Array(vec![Object::Ref(original_pages[2].obj), Object::name("Fit")]),
+        ]),
+    );
+    let leaf = doc.add(leaf);
+    let mut tree = leaf;
+    for _ in 0..16_384 {
+        let mut node = Dict::new();
+        node.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(tree)]));
+        tree = doc.add(node);
+    }
+    let mut names = Dict::new();
+    names.set(b"Dests".to_vec(), Object::Ref(tree));
+    doc.update_dict(doc.root().unwrap(), |d| d.set(b"Names".to_vec(), Object::Dict(names))).unwrap();
+
+    // Every node is a shallow indirect object: the page operation must not turn the
+    // document's graph depth into call-stack depth.
+    delete_pages(&mut doc, &[0]).unwrap();
+    for bytes in [write_incremental(&doc, &SaveOptions::default()).unwrap(), write_full(&doc, &SaveOptions::default()).unwrap()] {
+        let reopened = open(bytes);
+        assert_eq!(labels(&reopened), ["A2", "A3"]);
+        let catalog = reopened.get(reopened.root().unwrap());
+        let names = reopened.resolve(catalog.as_dict().unwrap().get(b"Names").unwrap());
+        let mut node = reopened.resolve(names.as_dict().unwrap().get(b"Dests").unwrap());
+        for _ in 0..16_384 {
+            let child = node.as_dict().unwrap().get(b"Kids").unwrap().as_array().unwrap()[0].clone();
+            node = reopened.resolve(&child);
+        }
+        let pairs = node.as_dict().unwrap().get(b"Names").and_then(Object::as_array).cloned().unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs[0].as_string().unwrap().to_text(), "kept");
+        assert_eq!(pairs[1].as_array().unwrap()[0].as_ref(), Some(pages(&reopened).unwrap()[1].obj));
+    }
+}
+
+#[test]
+fn destination_pruning_visits_shared_and_cyclic_nodes_once() {
+    for inline_names in [false, true] {
+        for inline_tree in [false, true] {
+            let mut doc = doc_a();
+            let gone = pages(&doc).unwrap()[0].obj;
+            let mut leaf = Dict::new();
+            leaf.set(
+                b"Names".to_vec(),
+                Object::Array(vec![Object::String(PdfString::text("gone")), Object::Array(vec![Object::Ref(gone), Object::name("Fit")])]),
+            );
+            leaf.set(b"Unknown".to_vec(), Object::Int(42));
+            let leaf = doc.add(leaf);
+            let cycle = doc.add(Object::Null);
+            let mut node = Dict::new();
+            node.set(b"Kids".to_vec(), Object::Array(vec![Object::Ref(cycle), Object::Ref(leaf), Object::Ref(leaf)]));
+            doc.set(cycle, Object::Dict(node.clone()));
+            let mut names = Dict::new();
+            names.set(b"Dests".to_vec(), if inline_tree { Object::Dict(node) } else { Object::Ref(cycle) });
+            let names = if inline_names { Object::Dict(names) } else { Object::Ref(doc.add(names)) };
+            doc.update_dict(doc.root().unwrap(), |d| d.set(b"Names".to_vec(), names)).unwrap();
+
+            assert_eq!(drop_named_destinations(&mut doc, &[gone]).unwrap(), [b"gone".to_vec()]);
+            let leaf = doc.get(leaf);
+            assert_eq!(leaf.as_dict().unwrap().get(b"Names").and_then(Object::as_array).unwrap().len(), 0);
+            assert_eq!(leaf.as_dict().unwrap().int(b"Unknown"), Some(42));
+        }
+    }
+}
+
+#[test]
+fn deleting_a_page_keeps_sixty_thousand_named_destinations_usable() {
+    let mut doc = doc_a();
+    let original_pages = pages(&doc).unwrap();
+    let pairs: Vec<Object> = (0..60_000)
+        .flat_map(|i| {
+            let page = if i % 2 == 0 { original_pages[0].obj } else { original_pages[2].obj };
+            [Object::String(PdfString::text(&format!("dest-{i:05}"))), Object::Array(vec![Object::Ref(page), Object::name("Fit")])]
+        })
+        .collect();
+    let mut leaf = Dict::new();
+    leaf.set(b"Names".to_vec(), Object::Array(pairs));
+    leaf.set(b"Unknown".to_vec(), Object::Int(42));
+    let leaf = doc.add(leaf);
+    let mut names = Dict::new();
+    names.set(b"Dests".to_vec(), Object::Ref(leaf));
+    doc.update_dict(doc.root().unwrap(), |d| d.set(b"Names".to_vec(), Object::Dict(names))).unwrap();
+
+    // A valid large book exceeds the former 100,000-entry budget (two entries per name).
+    delete_pages(&mut doc, &[0]).unwrap();
+    for bytes in [write_incremental(&doc, &SaveOptions::default()).unwrap(), write_full(&doc, &SaveOptions::default()).unwrap()] {
+        let reopened = open(bytes);
+        assert_eq!(labels(&reopened), ["A2", "A3"]);
+        let catalog = reopened.get(reopened.root().unwrap());
+        let names = reopened.resolve(catalog.as_dict().unwrap().get(b"Names").unwrap());
+        let leaf = reopened.resolve(names.as_dict().unwrap().get(b"Dests").unwrap());
+        let leaf = leaf.as_dict().unwrap();
+        assert_eq!(leaf.int(b"Unknown"), Some(42));
+        let pairs = leaf.get(b"Names").unwrap().as_array().unwrap();
+        assert_eq!(pairs.len(), 60_000, "30,000 surviving name/value pairs");
+        let page = pages(&reopened).unwrap()[1].obj;
+        for (pair, i) in pairs.as_chunks::<2>().0.iter().zip((1..60_000).step_by(2)) {
+            assert_eq!(pair[0].as_string().unwrap().to_text(), format!("dest-{i:05}"));
+            assert_eq!(pair[1].as_array().unwrap()[0].as_ref(), Some(page));
+        }
+    }
+}
+
+#[test]
 fn deleted_pages_are_not_kept_by_what_points_at_them() {
     // A1 links to A3, a bookmark goes to A3, and A2 holds the form's only field. After deleting
     // A2 and A3 neither page, its content nor the field may stay in the saved file.
@@ -516,6 +629,155 @@ fn document_info_edits_update_the_xmp_packet() {
 }
 
 #[test]
+fn creation_and_mod_date_edits_round_trip_and_update_xmp() {
+    let mut doc = doc_with_xmp(LIBREOFFICE_XMP.as_bytes());
+    // Edit with human-readable and PDF date formats
+    set_info(&mut doc, "CreationDate", "2024-05-10 14:30:00Z").unwrap();
+    set_info(&mut doc, "ModDate", "D:20261020193210Z").unwrap();
+    let saved = save_and_reopen(&doc);
+    assert_eq!(info(&saved, "CreationDate").as_deref(), Some("D:20240510143000Z"));
+    assert_eq!(info(&saved, "ModDate").as_deref(), Some("D:20261020193210Z"));
+
+    // Case-insensitive key test
+    assert_eq!(info(&saved, "creationdate").as_deref(), Some("D:20240510143000Z"));
+    assert_eq!(info(&saved, "moddate").as_deref(), Some("D:20261020193210Z"));
+
+    // Check XMP synchronization
+    let xmp = xmp_text(&saved).unwrap();
+    assert_eq!(xmp_values(&xmp, "xmp:CreateDate"), ["2024-05-10T14:30:00Z"]);
+    assert_eq!(xmp_values(&xmp, "xmp:ModifyDate"), ["2026-10-20T19:32:10Z"]);
+
+    // Test clearing dates
+    let mut doc2 = saved;
+    set_info(&mut doc2, "CreationDate", "").unwrap();
+    let saved2 = save_and_reopen(&doc2);
+    assert_eq!(info(&saved2, "CreationDate"), None);
+    let xmp2 = xmp_text(&saved2).unwrap();
+    assert!(xmp_values(&xmp2, "xmp:CreateDate").is_empty());
+}
+
+#[test]
+fn format_pdf_date_formats_and_normalizes_correctly() {
+    use crate::{format_pdf_date, normalize_pdf_date};
+
+    // User's exact case:
+    assert_eq!(format_pdf_date("D:20261020161649+03'00'"), "10/20/26, 4:16:49 PM +03:00");
+    let local_suffix = crate::local_tz_suffix();
+    assert_eq!(normalize_pdf_date("10/20/26, 4:16:49 PM"), format!("D:20261020161649{local_suffix}"));
+    assert_eq!(normalize_pdf_date("10/20/26, 4:16:49\u{202f}PM"), format!("D:20261020161649{local_suffix}"));
+    assert_eq!(normalize_pdf_date("10/20/26, 4:16:49 PM Z"), "D:20261020161649Z");
+    assert_eq!(normalize_pdf_date("10/20/26, 4:16:49 PM +03:00"), "D:20261020161649+03'00'");
+
+    // Morning and midnight/noon cases
+    assert_eq!(format_pdf_date("D:20240508090503Z"), "5/8/24, 9:05:03 AM Z");
+    assert_eq!(normalize_pdf_date("5/8/24, 9:05:03 AM Z"), "D:20240508090503Z");
+    assert_eq!(format_pdf_date("D:20240101000000Z"), "1/1/24, 12:00:00 AM Z");
+    assert_eq!(normalize_pdf_date("1/1/24, 12:00:00 AM Z"), "D:20240101000000Z");
+    assert_eq!(format_pdf_date("D:20240101120000Z"), "1/1/24, 12:00:00 PM Z");
+    assert_eq!(normalize_pdf_date("1/1/24, 12:00:00 PM Z"), "D:20240101120000Z");
+
+    // Year outside 1970..2070 preserved as 4 digits
+    assert_eq!(format_pdf_date("D:19650101120000Z"), "1/1/1965, 12:00:00 PM Z");
+    assert_eq!(format_pdf_date("D:20750101120000Z"), "1/1/2075, 12:00:00 PM Z");
+
+    // Without timezone suffix
+    assert_eq!(format_pdf_date("D:20261020161649"), "10/20/26, 4:16:49 PM");
+
+    // 4-digit year format
+    assert_eq!(normalize_pdf_date("10/20/2026, 4:16:49 PM Z"), "D:20261020161649Z");
+
+    // ISO format
+    assert_eq!(format_pdf_date("2026-10-20T16:16:49Z"), "10/20/26, 4:16:49 PM Z");
+
+    // Explicit timezone offset:
+    assert_eq!(crate::normalize_pdf_date_with("10/20/26, 4:16:49 PM", 0), "D:20261020161649Z");
+    assert_eq!(crate::normalize_pdf_date_with("10/20/26, 4:16:49 PM", 7200), "D:20261020161649+02'00'");
+    assert_eq!(crate::normalize_pdf_date_with("10/20/26, 4:16:49 PM", -18000), "D:20261020161649-05'00'");
+
+    // Non-dates are returned unchanged
+    assert_eq!(format_pdf_date(""), "");
+    assert_eq!(format_pdf_date("yesterday"), "yesterday");
+}
+
+#[test]
+fn is_valid_pdf_date_input_checks_pattern_correctly() {
+    use crate::{is_valid_pdf_date_input, set_info};
+
+    // Valid formats:
+    assert!(is_valid_pdf_date_input(""));
+    assert!(is_valid_pdf_date_input("   "));
+    assert!(is_valid_pdf_date_input("10/20/26, 4:16:49 PM"));
+    assert!(is_valid_pdf_date_input("10/20/26, 4:16:49\u{202f}PM"));
+    assert!(is_valid_pdf_date_input("10/20/26, 4:16:49 PM Z"));
+    assert!(is_valid_pdf_date_input("10/20/26, 4:16:49 PM +03:00"));
+    assert!(is_valid_pdf_date_input("5/8/24, 9:05:03 AM"));
+    assert!(is_valid_pdf_date_input("1/1/24, 12:00:00 AM"));
+    assert!(is_valid_pdf_date_input("10/20/2026, 4:16:49 PM"));
+    assert!(is_valid_pdf_date_input("2026-10-20 16:16:49"));
+    assert!(is_valid_pdf_date_input("2026-10-20T16:16:49Z"));
+    assert!(is_valid_pdf_date_input("D:20261020161649+03'00'"));
+    assert!(is_valid_pdf_date_input("D:20261020161649Z"));
+    assert!(is_valid_pdf_date_input("D:2026"));
+    assert!(is_valid_pdf_date_input("D:202610"));
+    assert!(is_valid_pdf_date_input("D:20261020"));
+
+    // 4-digit year format preservation (e.g. 0085 vs 2-digit 85)
+    assert_eq!(normalize_pdf_date("1/1/0085, 12:00:00 PM Z"), "D:00850101120000Z");
+    assert_eq!(normalize_pdf_date("1/1/85, 12:00:00 PM Z"), "D:19850101120000Z");
+
+    // Pure digits
+    assert!(is_valid_pdf_date_input("2026"));
+    assert!(is_valid_pdf_date_input("202610"));
+    assert!(is_valid_pdf_date_input("20261020"));
+    assert!(!is_valid_pdf_date_input("20261")); // 5 digits (partial)
+    assert!(!is_valid_pdf_date_input("202610201")); // 9 digits (partial)
+
+    // Slash and ISO invalid timezone offsets and malformed separators:
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:16:49 PM +99:99"));
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:16:49 PM +03:60"));
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:16:49 PM +03::00"));
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:16:49 PM +03''00'"));
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:16:49 PM +:0300"));
+    assert!(!is_valid_pdf_date_input("2026-10-20 16:16:49+99:99"));
+    assert!(!is_valid_pdf_date_input("2026-10-20T16:16:49+03:60"));
+    assert!(!is_valid_pdf_date_input("2026-10-20 16:16:49+03::00"));
+
+    // Invalid formats:
+    assert!(!is_valid_pdf_date_input("1/1/0000, 12:00:00 PM Z")); // year zero in slash format
+    assert_eq!(normalize_pdf_date("1/1/0000, 12:00:00 PM Z"), "");
+    assert!(!is_valid_pdf_date_input("not-a-date"));
+    assert!(!is_valid_pdf_date_input("random words"));
+    assert!(!is_valid_pdf_date_input("10/20"));
+    assert!(!is_valid_pdf_date_input("13/20/26, 4:16:49 PM")); // month 13
+    assert!(!is_valid_pdf_date_input("10/32/26, 4:16:49 PM")); // day 32
+    assert!(!is_valid_pdf_date_input("2/29/26, 4:16:49 PM")); // 2026 is not a leap year
+    assert!(is_valid_pdf_date_input("2/29/24, 4:16:49 PM")); // 2024 is a leap year
+    assert!(!is_valid_pdf_date_input("10/20/26, 13:16:49 PM")); // hour 13 with PM
+    assert!(!is_valid_pdf_date_input("10/20/26, 0:16:49 PM")); // hour 0 with PM
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:60:49 PM")); // minute 60
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:16:60 PM")); // second 60
+    assert!(!is_valid_pdf_date_input("10/20/26, 4:16:49 XM")); // invalid AM/PM
+    assert!(!is_valid_pdf_date_input("D:invalid"));
+    assert!(!is_valid_pdf_date_input("D:20261301")); // month 13 in PDF date
+    assert!(!is_valid_pdf_date_input("D:20261")); // 5 digits (partial)
+    assert!(!is_valid_pdf_date_input("D:202610201")); // 9 digits (partial)
+    assert!(!is_valid_pdf_date_input("D:2026 hello")); // trailing text
+    assert!(!is_valid_pdf_date_input("D:20261020xyz")); // trailing text
+    assert!(!is_valid_pdf_date_input("D:20261020161649+99'99'")); // invalid offset hour
+    assert!(!is_valid_pdf_date_input("D:20261020161649+03'60'")); // invalid offset minute
+
+    // set_info rejects invalid date format with error:
+    let mut doc = open(fixture());
+    let err = set_info(&mut doc, "CreationDate", "bad-date-string").unwrap_err();
+    assert!(matches!(err, crate::OrganizeError::Invalid(_)));
+
+    // set_info_with_offset normalizes with provided offset:
+    let mut doc2 = open(fixture());
+    crate::set_info_with_offset(&mut doc2, "CreationDate", "2026-10-20 16:16:49", 7200).unwrap();
+    assert_eq!(crate::info(&doc2, "CreationDate").as_deref(), Some("D:20261020161649+02'00'"));
+}
+
+#[test]
 fn document_info_edits_leave_files_without_usable_xmp_alone() {
     // No packet: none is added.
     let mut doc = open(fixture());
@@ -772,6 +1034,33 @@ fn resources_split_between_page_and_tree_travel_together() {
         assert_eq!(font(b"F1").as_deref(), Some(&b"Helvetica"[..]), "a name only the tree has is added");
         assert_eq!(font(b"F2").as_deref(), Some(&b"Courier"[..]), "the page's own entry wins over the tree's");
     }
+}
+
+#[test]
+fn a_scan_whose_xref_misses_the_image_combines_with_the_image() {
+    // A cheap image-to-PDF converter's table: "0 5" followed by the entries of objects 1 to 5,
+    // so the image (object 5) has none. Viewers rebuild the table and show the scan; the
+    // combined copy got a null image and came out blank (#1628).
+    let b: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>".into(),
+        "<< /Length 26 >>\nstream\n100 0 0 100 0 0 cm /Im0 Do\nendstream".into(),
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 1 >>\nstream\nA\nendstream".into(),
+    ];
+    let good = build(&b, "/Root 1 0 R");
+    let text = String::from_utf8_lossy(&good).into_owned();
+    let at = text.rfind("\nxref\n").unwrap() + 1;
+    let entries: Vec<&str> = text[at..].lines().skip(3).take(5).collect();
+    let mut bytes = good[..at].to_vec();
+    bytes.extend_from_slice(format!("xref\n0 5\n{}\ntrailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{at}\n%%EOF\n", entries.join("\n")).as_bytes());
+    let src = open(bytes);
+    let out = full_roundtrip(&combine(&[("scan", &src)]).unwrap());
+    let res = out.dict(page_dict(&out, 0).get(b"Resources").unwrap()).unwrap();
+    let image = res.get(b"XObject").and_then(|x| out.dict(x)).and_then(|d| d.get(b"Im0").map(|v| out.resolve(v))).expect("the page lists its image");
+    let Object::Stream(image) = &*image else { panic!("the image is a stream, not {image:?}") };
+    assert_eq!(image.dict.name(b"Subtype"), Some(&b"Image"[..]));
+    assert_eq!(image.decoded().unwrap(), b"A");
 }
 
 #[test]
@@ -1045,6 +1334,37 @@ fn malformed_output_intents_and_identification_do_not_fail() {
     let xmp = x.xmp.expect("XMP metadata");
     assert!(xmp.contains("<pdfxid:GTS_PDFXVersion>&lt;PDF/X-4 &amp; &quot;more&quot;&gt;</pdfxid:GTS_PDFXVersion>"), "{xmp}");
     assert!(!xmp.contains('\0') && !xmp.contains("GTS_PDFXConformance"), "{xmp}");
+}
+
+#[test]
+fn removing_the_pdfx_identification_keeps_the_output_intent_and_other_claims() {
+    let mut x4 = doc_x4("FOGRA51", "icc");
+    assert!(matches!(remove_standard_id(&mut x4, Standard::PdfA), Err(OrganizeError::Invalid(_))));
+    assert!(!x4.is_modified(), "a refused removal changes nothing");
+    remove_standard_id(&mut x4, Standard::PdfX).unwrap();
+    let x = pdfx_of(&full_roundtrip(&x4));
+    assert_eq!((x.version, x.intents), (None, vec![("FOGRA51".to_string(), b"icc".to_vec())]));
+    assert!(x.xmp.is_some_and(|x| !x.contains("pdfxid:GTS") && x.contains("pdfuaid:part=\"1\"")), "PDF/UA's claim stays");
+    assert!(matches!(remove_standard_id(&mut x4, Standard::PdfX), Err(OrganizeError::Invalid(_))), "nothing left to remove");
+
+    let mut x1a = doc_print("CGATS TR 001", "icc", "/GTS_PDFXVersion (PDF/X-1:2001) /GTS_PDFXConformance (PDF/X-1a:2001)", None);
+    remove_standard_id(&mut x1a, Standard::PdfX).unwrap();
+    assert_eq!((info(&x1a, "GTS_PDFXVersion"), info(&x1a, "GTS_PDFXConformance")), (None, None));
+}
+
+#[test]
+fn removing_the_pdfa_identification_removes_its_xmp_properties_in_either_form() {
+    let xmp = "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description \
+               rdf:about=\"\" xmlns:pdfaid=\"http://www.aiim.org/pdfa/ns/id/\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" pdfaid:conformance='B'>\
+               <pdfaid:part>2</pdfaid:part><dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Report</rdf:li></rdf:Alt></dc:title>\
+               </rdf:Description></rdf:RDF></x:xmpmeta>";
+    let mut doc = doc_print("sRGB IEC61966-2.1", "icc", "/Title (Report)", Some(xmp));
+    remove_standard_id(&mut doc, Standard::PdfA).unwrap();
+    let x = pdfx_of(&full_roundtrip(&doc));
+    let packet = x.xmp.unwrap();
+    assert!(!packet.contains("pdfaid:part") && !packet.contains("pdfaid:conformance"), "{packet}");
+    assert!(packet.contains(">Report</rdf:li>"), "the rest of the packet stays: {packet}");
+    assert_eq!(x.intents.len(), 1, "the output intent stays");
 }
 
 #[test]
@@ -2750,27 +3070,31 @@ fn combine_field_conflicts_previews_each_file_in_order() {
     assert_eq!(preview[2], [("Text1".to_string(), "Text1-2".to_string())], "the cascade continues past the earlier rename");
 }
 
+/// A one-page source whose page refers (`/Foo`) to object 6, followed by `tail` as objects 6, 7, …
+fn chained(tail: &[String]) -> Document {
+    let mut b: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Foo 6 0 R >>".into(),
+        body("C1"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+    ];
+    b.extend_from_slice(tail);
+    open(build(&b, "/Root 1 0 R"))
+}
+
+/// [`chained`] with `n` objects, each referring to the next.
+fn chain(n: usize) -> Document {
+    let mut tail: Vec<String> = (0..n).map(|i| format!("<< /Next {} 0 R >>", 7 + i)).collect();
+    tail.push("<< /End true >>".into());
+    chained(&tail)
+}
+
 /// #1800: thousands of shallow objects, each referring to the next, used to recurse once per
 /// object and exhaust the stack. The copy is refused instead, and the destination is as it was;
 /// a chain within the budget and a short cycle copy as before.
 #[test]
 fn a_chain_of_objects_too_deep_to_copy_is_refused_and_leaves_the_destination_alone() {
-    fn chained(tail: &[String]) -> Document {
-        let mut b: Vec<String> = vec![
-            "<< /Type /Catalog /Pages 2 0 R >>".into(),
-            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>".into(),
-            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Foo 6 0 R >>".into(),
-            body("C1"),
-            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
-        ];
-        b.extend_from_slice(tail);
-        open(build(&b, "/Root 1 0 R"))
-    }
-    fn chain(n: usize) -> Document {
-        let mut tail: Vec<String> = (0..n).map(|i| format!("<< /Next {} 0 R >>", 7 + i)).collect();
-        tail.push("<< /End true >>".into());
-        chained(&tail)
-    }
     // On a thread with less stack than any platform's main thread, so the budget is proven.
     let run = std::thread::Builder::new()
         .stack_size(512 << 10)
@@ -2788,6 +3112,81 @@ fn a_chain_of_objects_too_deep_to_copy_is_refused_and_leaves_the_destination_alo
         .unwrap()
         .join();
     assert!(run.is_ok(), "the copy must not overflow the stack");
+}
+
+/// The fixture after an update that adds object 20 and declares `/Size 4294967295`. No number is
+/// left above that, so [`Document::add`] fills free numbers from 12 on, the gap below object 20 first.
+fn fixture_with_an_exhausted_size() -> Document {
+    let mut bytes = fixture();
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let prev: usize = text.rsplit("startxref").next().and_then(|t| t.split_whitespace().next()).and_then(|n| n.parse().ok()).expect("startxref");
+    let added = bytes.len();
+    bytes.extend_from_slice(b"20 0 obj\n<< /Unused true >>\nendobj\n");
+    let xref = bytes.len();
+    bytes.extend_from_slice(
+        format!(
+            "xref\n20 1\n{added:010} 00000 n \ntrailer\n<< /Size 4294967295 /Root 1 0 R /Info 11 0 R /Prev {prev} >>\nstartxref\n{xref}\n%%EOF\n"
+        )
+        .as_bytes(),
+    );
+    let doc = open(bytes);
+    assert!(doc.repair_log().iter().any(|l| l.contains("exhausted trailer")), "{:?}", doc.repair_log());
+    doc
+}
+
+/// The fixture holding object 4294967295, as a document does once an edit writes to an object of
+/// that number (a damaged file's catalog, say). [`Document::add`] then fills free numbers below it.
+fn fixture_holding_object_4294967295() -> Document {
+    let mut doc = open(fixture());
+    doc.set(ObjRef::new(u32::MAX, 0), Object::String(PdfString::text("top")));
+    doc
+}
+
+/// Documents whose new objects are numbered in the gaps below their highest number.
+fn documents_numbering_new_objects_below_their_highest() -> [(&'static str, Document); 2] {
+    [("an exhausted /Size", fixture_with_an_exhausted_size()), ("object 4294967295", fixture_holding_object_4294967295())]
+}
+
+/// Duplicate, Replace and Insert Pages took the objects numbered above the destination's highest
+/// number for the ones the import added. When new objects fill gaps below it, the copies escaped
+/// resource sharing (each import stored the fonts again), and with object 4294967295 the number
+/// after the highest overflowed: a panic in debug builds, and in release a wrap to 0 that counted
+/// every object as added. The import now compares the object numbers before and after.
+#[test]
+fn an_import_shares_the_resources_it_added_wherever_they_are_numbered() {
+    let mut plain = open(fixture());
+    duplicate_pages(&mut plain, &[0], None).unwrap();
+    for (what, mut doc) in documents_numbering_new_objects_below_their_highest() {
+        let before = doc.object_numbers();
+        duplicate_pages(&mut doc, &[0], None).unwrap();
+        assert_eq!(labels(&doc), ["Page 1", "Page 1", "Page 2", "Page 3"], "{what}");
+        assert_eq!(count_fonts(&doc), count_fonts(&plain), "{what}: the copy shares the font, as it does in the plain fixture");
+        insert_file_pages(&mut doc, &open(fixture()), "Inserted", &[2], 0, FieldConflicts::Rename).unwrap();
+        assert_eq!(labels(&doc), ["Page 3", "Page 1", "Page 1", "Page 2", "Page 3"], "{what}");
+        assert_eq!(count_fonts(&doc), count_fonts(&plain), "{what}: the inserted page shares the font too");
+        let after = doc.object_numbers();
+        assert!(before.iter().all(|n| after.contains(n)), "{what}: every object the document had is still there");
+        assert_eq!(labels(&full_roundtrip(&doc)), ["Page 3", "Page 1", "Page 1", "Page 2", "Page 3"], "{what}");
+    }
+}
+
+/// A refused import takes back what it added, which in these documents is numbered below their
+/// highest object, and leaves the objects they had.
+#[test]
+fn a_refused_import_takes_back_what_it_added_wherever_it_is_numbered() {
+    let run = std::thread::Builder::new()
+        .stack_size(512 << 10)
+        .spawn(|| {
+            for (what, mut dst) in documents_numbering_new_objects_below_their_highest() {
+                let before = (labels(&dst), dst.object_numbers());
+                let err = import_pages(&mut dst, &chain(20_000), &[0], 0).unwrap_err();
+                assert!(matches!(&err, OrganizeError::Invalid(m) if m.contains("levels deep")), "{what}: {err:?}");
+                assert_eq!((labels(&dst), dst.object_numbers()), before, "{what}: the destination is as it was");
+            }
+        })
+        .unwrap()
+        .join();
+    assert!(run.is_ok(), "a refused import must leave the document as it was, without panicking");
 }
 
 #[test]
@@ -2820,4 +3219,300 @@ fn rotate_repeated_indices_accumulate_from_the_current_page_value() {
             }
         }
     }
+}
+
+#[test]
+fn a_bookmark_can_go_to_a_point_on_its_page_and_survives_save() {
+    let mut d = doc_a();
+    // No position: as before, `/XYZ null null null`, the page top at the reader's zoom.
+    crate::add_bookmark(&mut d, &[], 9, "Top", 0).unwrap();
+    // Only a height (a bookmark made at the top of the window), a full point, and only a left.
+    assert_eq!(crate::add_bookmark_at(&mut d, &[], 9, "Section", 1, None, Some(612.25)).unwrap(), vec![1]);
+    crate::add_bookmark_at(&mut d, &[], 9, "Table", 1, Some(72.5), Some(300.0)).unwrap();
+    crate::add_bookmark_at(&mut d, &[1], 9, "Inside", 2, Some(10.0), None).unwrap();
+    let view = |d: &Document, title: &str| crate::bookmarks(d).into_iter().find(|b| b.title == title).unwrap().view;
+    let xyz = |left, top| Some((b"XYZ".to_vec(), vec![left, top, None]));
+    let check = |d: &Document| {
+        assert_eq!(view(d, "Top"), xyz(None, None));
+        assert_eq!(view(d, "Section"), xyz(None, Some(612.25)));
+        assert_eq!(view(d, "Table"), xyz(Some(72.5), Some(300.0)));
+        assert_eq!(view(d, "Inside"), xyz(Some(10.0), None));
+        let page_of = |title: &str| crate::bookmarks(d).into_iter().find(|b| b.title == title).unwrap().page;
+        assert_eq!((page_of("Top"), page_of("Section"), page_of("Table"), page_of("Inside")), (Some(0), Some(1), Some(1), Some(2)));
+    };
+    check(&d);
+    check(&full_roundtrip(&d));
+}
+
+#[test]
+fn a_bookmark_position_that_is_not_a_number_is_refused_and_changes_nothing() {
+    let mut d = doc_a();
+    crate::add_bookmark(&mut d, &[], 9, "Keep", 0).unwrap();
+    for (left, top) in [(Some(f64::NAN), None), (None, Some(f64::INFINITY)), (Some(1.0), Some(f64::NEG_INFINITY))] {
+        assert_eq!(crate::add_bookmark_at(&mut d, &[], 9, "Bad", 0, left, top), Err(crate::OutlineError::BadPosition), "{left:?} {top:?}");
+    }
+    assert_eq!(titles(&crate::bookmarks(&d)), ["Keep"]);
+    // The page is still checked, and so is the title.
+    assert!(crate::add_bookmark_at(&mut d, &[], 9, "Nowhere", 7, Some(1.0), Some(1.0)).is_err());
+    assert_eq!(crate::add_bookmark_at(&mut d, &[], 9, " ", 0, Some(1.0), Some(1.0)), Err(crate::OutlineError::EmptyTitle));
+    assert_eq!(titles(&crate::bookmarks(&d)), ["Keep"]);
+}
+
+#[test]
+fn page_walk_skips_repeated_and_cyclic_kids_without_copying_attributes() {
+    let mut doc = open(fixture());
+    let (root, branch) = (ObjRef { num: 2, generation: 0 }, ObjRef { num: 3, generation: 0 });
+    let (first, second) = (ObjRef { num: 4, generation: 0 }, ObjRef { num: 5, generation: 0 });
+    // The branch node carries Resources for its pages: a cycle back to it, then both pages
+    // 128 times over.
+    let mut kids = vec![Object::Ref(branch)];
+    kids.extend([Object::Ref(first), Object::Ref(second)].into_iter().cycle().take(256));
+    doc.update_dict(branch, |d| d.set(b"Kids".to_vec(), Object::Array(kids))).unwrap();
+    let mut walk = PageWalk::new(&doc, root);
+    let (page, attrs) = walk.next().unwrap();
+    assert_eq!(page, first);
+    assert!(walk.pending.len() <= 3, "repeated kids retained {} pending entries", walk.pending.len());
+    assert!(attrs.get(b"Resources").and_then(|r| r.as_dict()).is_some_and(|r| r.contains(b"Font")), "Resources from the branch");
+    assert_eq!(attrs.get(b"Rotate").and_then(Object::as_int), Some(90), "Rotate from the root");
+    assert_eq!(walk.next().map(|(p, _)| p), Some(second));
+    let (_, last) = walk.next().unwrap();
+    let media_box = last.get(b"MediaBox").and_then(Object::as_array).map(|m| m.iter().filter_map(Object::as_int).collect::<Vec<_>>());
+    assert_eq!(media_box, Some(vec![0, 0, 500, 500]), "own MediaBox kept over the root's");
+    assert!(walk.next().is_none());
+    assert_eq!(labels(&doc), ["Page 1", "Page 2", "Page 3"]);
+}
+
+/// A one-page document whose page carries `annots` (object bodies 5…), with `extra` bodies after them.
+fn page_with_annots(annots: &[String], extra: &[String], catalog_extra: &str) -> Document {
+    let n = annots.len();
+    let refs: String = (0..n).map(|i| format!("{} 0 R ", i + 5)).collect();
+    let mut b: Vec<String> = vec![
+        format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>".into(),
+        format!("<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [{refs}] >>"),
+        body("P1"),
+    ];
+    b.extend(annots.iter().cloned());
+    b.extend(extra.iter().cloned());
+    open(build(&b, "/Root 1 0 R"))
+}
+
+#[test]
+fn registering_many_imported_fields_is_linear() {
+    let n = 2_000;
+    let widgets: Vec<String> = (0..n).map(|i| format!("<< /Type /Annot /Subtype /Widget /FT /Tx /T (f{i}) /Rect [0 0 10 10] >>")).collect();
+    let src = page_with_annots(&widgets, &[], "");
+    take_work();
+    let out = extract_pages(&src, &[0]).unwrap();
+    let work = take_work();
+    assert!(work <= 4 * n, "{work} steps registering {n} fields");
+    let form = out.resolve(catalog(&out).get(b"AcroForm").unwrap()).as_dict().cloned().unwrap();
+    assert_eq!(form.get(b"Fields").and_then(|f| f.as_array()).map(Vec::len), Some(n));
+}
+
+#[test]
+fn renaming_many_same_named_fields_resumes_the_suffix_search() {
+    let n = 2_000;
+    let widgets: Vec<String> = (0..n).map(|_| "<< /Type /Annot /Subtype /Widget /FT /Tx /T (x) /Rect [0 0 10 10] >>".to_string()).collect();
+    let src = page_with_annots(&widgets, &[], "");
+    take_work();
+    let renames = combine_field_conflicts(&[&src]).remove(0);
+    let work = take_work();
+    assert!(work <= 4 * n, "{work} suffix attempts for {n} fields");
+    // Still the first free variant, in order.
+    assert_eq!(renames.len(), n - 1);
+    assert_eq!(renames.first(), Some(&("x".to_string(), "x-1".to_string())));
+    assert_eq!(renames.last(), Some(&("x".to_string(), format!("x-{}", n - 1))));
+}
+
+#[test]
+fn annotation_actions_share_the_objects_they_copy() {
+    // Fifty links whose URI actions all point at one string object.
+    let n = 50;
+    let links: Vec<String> =
+        (0..n).map(|_| format!("<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /A << /S /URI /URI {} 0 R >> >>", n + 5)).collect();
+    let src = page_with_annots(&links, &["(https://example.com/shared)".into()], "");
+    let out = extract_pages(&src, &[0]).unwrap();
+    let copies = out
+        .object_numbers()
+        .into_iter()
+        .filter(|&o| out.get(ObjRef::new(o, out.generation(o))).as_string().is_some_and(|s| s.bytes == b"https://example.com/shared"))
+        .count();
+    assert_eq!(copies, 1, "the shared URI is copied once, not once per action");
+}
+
+#[test]
+fn name_trees_with_shared_kids_are_walked_once_per_node() {
+    // Each level lists the next one twice: 2^depth paths through `depth` nodes.
+    let depth = 10;
+    let first = 6; // after the catalog, pages, page, content and the link
+    let mut extra = Vec::new();
+    for tree in 0..2 {
+        let base = first + tree * (depth + 1);
+        for level in 0..depth {
+            let next = base + level + 1;
+            extra.push(format!("<< /Kids [{next} 0 R {next} 0 R] >>"));
+        }
+        extra.push(if tree == 0 {
+            "<< /Names [(a.txt) << /Type /Filespec /F (a.txt) >>] >>".into()
+        } else {
+            "<< /Names [(other) [3 0 R /Fit]] >>".into()
+        });
+    }
+    let link = "<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] /Dest (missing) >>".to_string();
+    let catalog_extra = format!("/Names << /EmbeddedFiles {first} 0 R /Dests {} 0 R >>", first + depth + 1);
+    let src = page_with_annots(&[link], &extra, &catalog_extra);
+    take_work();
+    let out = combine(&[("a", &src)]).unwrap();
+    let work = take_work();
+    assert!(work <= 8 * (depth + 1), "{work} name-tree nodes visited");
+    let names = out.resolve(catalog(&out).get(b"Names").unwrap()).as_dict().cloned().unwrap();
+    let tree = out.resolve(names.get(b"EmbeddedFiles").unwrap()).as_dict().cloned().unwrap();
+    assert_eq!(tree.get(b"Names").and_then(|n| n.as_array()).map(Vec::len), Some(2), "one attachment, listed once");
+}
+
+#[test]
+fn a_form_drawing_itself_repeatedly_is_analysed_once() {
+    let form = "/F Do /F Do /F Do /F Do";
+    let b: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 400] >>".into(),
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /XObject << /F 5 0 R /Unused 6 0 R >> >> >>".into(),
+        "<< /Length 5 >>\nstream\n/F Do\nendstream".into(),
+        format!(
+            "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Resources << /XObject << /F 5 0 R >> >> /Length {} >>\nstream\n{form}\nendstream",
+            form.len()
+        ),
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 10 10] /Length 0 >>\nstream\n\nendstream".into(),
+    ];
+    let src = open(build(&b, "/Root 1 0 R"));
+    take_work();
+    let out = extract_pages(&src, &[0]).unwrap();
+    let work = take_work();
+    assert!(work <= 4, "{work} form analyses");
+    let page = out.get(pages(&out).unwrap()[0].obj).as_dict().cloned().unwrap();
+    let res = out.resolve(page.get(b"Resources").unwrap()).as_dict().cloned().unwrap();
+    let x = out.resolve(res.get(b"XObject").unwrap()).as_dict().cloned().unwrap();
+    assert!(x.contains(b"F") && !x.contains(b"Unused"), "pruning still keeps what is drawn and drops the rest");
+}
+
+/// One page whose /Contents names the same 1 MiB stream 300 times (a few kilobytes on disk).
+fn repeated_contents() -> Document {
+    use pdfcraft_cos::{Dict, Stream};
+    let mut doc = Document::new_empty();
+    let stream = doc.add(Stream::flate(Dict::new(), &vec![b' '; 1 << 20]));
+    let pages = doc.add(Object::Null);
+    let page: Dict = [
+        (b"Type".to_vec(), Object::Name(b"Page".to_vec())),
+        (b"Parent".to_vec(), Object::Ref(pages)),
+        (b"MediaBox".to_vec(), Object::Array([0, 0, 200, 300].map(Object::from).to_vec())),
+        (b"Contents".to_vec(), Object::Array(vec![Object::Ref(stream); 300])),
+    ]
+    .into_iter()
+    .collect();
+    let page = doc.add(page);
+    let tree: Dict = [
+        (b"Type".to_vec(), Object::Name(b"Pages".to_vec())),
+        (b"Kids".to_vec(), Object::Array(vec![Object::Ref(page)])),
+        (b"Count".to_vec(), Object::Int(1)),
+    ]
+    .into_iter()
+    .collect();
+    doc.set(pages, Object::Dict(tree));
+    let catalog: Dict = [(b"Type".to_vec(), Object::Name(b"Catalog".to_vec())), (b"Pages".to_vec(), Object::Ref(pages))].into_iter().collect();
+    let catalog = doc.add(catalog);
+    doc.trailer_mut().set(b"Root".to_vec(), Object::Ref(catalog));
+    doc
+}
+
+#[test]
+fn repeated_content_references_share_one_decode_budget() {
+    let src = repeated_contents();
+    let mut dst = Document::new_empty();
+    if let Ok((form, _)) = page_as_form(&mut dst, &src, 0) {
+        let Object::Stream(s) = &*dst.get(form) else { panic!("not a stream") };
+        let len = s.decoded().unwrap().len();
+        assert!(len <= pdfcraft_cos::MAX_PAGE_DECODED + 300, "{len} bytes");
+    }
+}
+
+/// #3193: the bookmark list reads a bookmark's colour and style as the inspector does (ISO
+/// 32000-2 §12.3.3, Tables 151 and 152): `/C` within 0–1, black and malformed values as none,
+/// `/F` bit 1 italic and bit 2 bold, through indirect values too.
+#[test]
+fn bookmarks_report_their_colour_and_style() {
+    let mut objs: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 400] >>".into(),
+        "<< /Type /Page /Parent 2 0 R >>".into(),
+        "<< /Type /Outlines /First 5 0 R /Last 10 0 R /Count 6 >>".into(),
+    ];
+    objs.push("<< /Title (Plain) /Parent 4 0 R /Next 6 0 R /Dest [3 0 R /Fit] >>".into()); // 5
+    objs.push("<< /Title (Red bold) /Parent 4 0 R /Prev 5 0 R /Next 7 0 R /Dest [3 0 R /Fit] /C [1 0 0] /F 2 >>".into()); // 6
+    objs.push("<< /Title (Indirect) /Parent 4 0 R /Prev 6 0 R /Next 8 0 R /Dest [3 0 R /Fit] /C 11 0 R /F 12 0 R >>".into()); // 7
+    objs.push("<< /Title (Black) /Parent 4 0 R /Prev 7 0 R /Next 9 0 R /Dest [3 0 R /Fit] /C [0 0 0] /F 1 >>".into()); // 8
+    objs.push("<< /Title (Bright) /Parent 4 0 R /Prev 8 0 R /Next 10 0 R /Dest [3 0 R /Fit] /C [2 -1 0.5] >>".into()); // 9
+    objs.push("<< /Title (Short) /Parent 4 0 R /Prev 9 0 R /Dest [3 0 R /Fit] /C [1 0] /F 4 >>".into()); // 10
+    objs.push("[0 0.5 0]".into()); // 11
+    objs.push("3".into()); // 12
+    let doc = open(build(&objs, "/Root 1 0 R"));
+    let got: Vec<(String, Option<[f32; 3]>, bool, bool)> = bookmarks(&doc).into_iter().map(|b| (b.title, b.color, b.italic, b.bold)).collect();
+    assert_eq!(
+        got,
+        [
+            ("Plain".into(), None, false, false),
+            ("Red bold".into(), Some([1.0, 0.0, 0.0]), false, true),
+            ("Indirect".into(), Some([0.0, 0.5, 0.0]), true, true),
+            ("Black".into(), None, true, false),
+            ("Bright".into(), Some([1.0, 0.0, 0.5]), false, false),
+            ("Short".into(), None, false, false),
+        ]
+    );
+}
+
+/// #3193: setting a bookmark's style and colour writes what ISO 32000-2 §12.3.3 asks for: bold is
+/// `/F 2` and bold italic `/F 3` (Table 152), and neither removes `/F`, whose default is 0; a
+/// style change leaves `/C` alone and a colour change leaves `/F`; black, the default (Table 151),
+/// removes `/C`. Bits the table doesn't define are kept, and a colour outside 0–1 is refused.
+#[test]
+fn bookmark_style_and_colour_are_set_as_the_table_says() {
+    let mut objs: Vec<String> = vec![
+        "<< /Type /Catalog /Pages 2 0 R /Outlines 4 0 R >>".into(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 400] >>".into(),
+        "<< /Type /Page /Parent 2 0 R >>".into(),
+        "<< /Type /Outlines /First 5 0 R /Last 6 0 R /Count 2 >>".into(),
+    ];
+    objs.push("<< /Title (Plain) /Parent 4 0 R /Next 6 0 R /Dest [3 0 R /Fit] >>".into()); // 5
+    objs.push("<< /Title (Odd bits) /Parent 4 0 R /Prev 5 0 R /Dest [3 0 R /Fit] /F 4 /C [1 0 0] >>".into()); // 6
+    let mut doc = open(build(&objs, "/Root 1 0 R"));
+    let raw = |doc: &Document, n: u32, key: &[u8]| doc.get(ObjRef { num: n, generation: 0 }).as_dict().and_then(|d| d.get(key).cloned());
+    crate::set_bookmark_style(&mut doc, &[0], Some(true), None).unwrap();
+    assert_eq!(raw(&doc, 5, b"F"), Some(Object::Int(2)), "bold");
+    crate::set_bookmark_style(&mut doc, &[0], None, Some(true)).unwrap();
+    assert_eq!(raw(&doc, 5, b"F"), Some(Object::Int(3)), "bold italic");
+    crate::set_bookmark_color(&mut doc, &[0], Some([0.0, 0.5, 0.0])).unwrap();
+    assert_eq!(raw(&doc, 5, b"C"), Some(Object::Array(vec![Object::Real(0.0), Object::Real(0.5), Object::Real(0.0)])));
+    assert_eq!(raw(&doc, 5, b"F"), Some(Object::Int(3)), "a colour change keeps the style");
+    crate::set_bookmark_style(&mut doc, &[0], Some(false), Some(false)).unwrap();
+    assert_eq!(raw(&doc, 5, b"F"), None, "regular removes /F");
+    assert!(raw(&doc, 5, b"C").is_some(), "a style change keeps the colour");
+    crate::set_bookmark_color(&mut doc, &[0], Some([0.0; 3])).unwrap();
+    assert_eq!(raw(&doc, 5, b"C"), None, "black removes /C");
+
+    crate::set_bookmark_style(&mut doc, &[1], Some(true), None).unwrap();
+    assert_eq!(raw(&doc, 6, b"F"), Some(Object::Int(6)), "bold beside a bit the table doesn't define");
+    crate::set_bookmark_style(&mut doc, &[1], Some(false), Some(false)).unwrap();
+    assert_eq!(raw(&doc, 6, b"F"), Some(Object::Int(4)), "that bit stays");
+    crate::set_bookmark_color(&mut doc, &[1], None).unwrap();
+    assert_eq!(raw(&doc, 6, b"C"), None, "no colour is black");
+    for bad in [[1.5, 0.0, 0.0], [0.0, -0.1, 0.0], [f64::NAN, 0.0, 0.0]] {
+        assert_eq!(crate::set_bookmark_color(&mut doc, &[1], Some(bad)), Err(crate::OutlineError::BadColor), "{bad:?}");
+    }
+    assert_eq!(crate::set_bookmark_style(&mut doc, &[7], Some(true), None), Err(crate::OutlineError::NoSuchBookmark(vec![7])));
+
+    crate::set_bookmark_style(&mut doc, &[0], Some(true), Some(true)).unwrap();
+    crate::set_bookmark_color(&mut doc, &[0], Some([0.0, 0.0, 1.0])).unwrap();
+    let saved = open(write_full(&doc, &SaveOptions::default()).unwrap());
+    let got: Vec<_> = bookmarks(&saved).into_iter().map(|b| (b.color, b.bold, b.italic)).collect();
+    assert_eq!(got, [(Some([0.0, 0.0, 1.0]), true, true), (None, false, false)]);
 }

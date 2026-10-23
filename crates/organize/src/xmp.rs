@@ -36,6 +36,27 @@ enum Shape {
     Text,
 }
 
+/// A PDF date (`D:YYYYMMDDHHmmSS...`) as an XMP (ISO 8601) date.
+pub fn iso_date(pdf: &str) -> Option<String> {
+    let d = pdf.trim().trim_start_matches("D:").trim_start_matches("d:");
+    let digits: String = d.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 4 {
+        return None;
+    }
+    let part = |a: usize, b: usize, def: &str| digits.get(a..b).unwrap_or(def).to_string();
+    let (y, mo, da, h, mi, s) = (part(0, 4, "0000"), part(4, 6, "01"), part(6, 8, "01"), part(8, 10, "00"), part(10, 12, "00"), part(12, 14, "00"));
+    let rest = &d[digits.len()..];
+    let tz = match rest.chars().next() {
+        Some('Z' | 'z') | None => "Z".to_string(),
+        Some(sign @ ('+' | '-')) => {
+            let t: String = rest[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+            format!("{sign}{}:{}", t.get(0..2).unwrap_or("00"), t.get(2..4).unwrap_or("00"))
+        }
+        _ => "Z".to_string(),
+    };
+    Some(format!("{y}-{mo}-{da}T{h}:{mi}:{s}{tz}"))
+}
+
 /// The XMP property (qualified name, namespace) that mirrors a document information key.
 fn property(key: &str) -> Option<(&'static str, &'static str, Shape)> {
     Some(match key {
@@ -45,6 +66,8 @@ fn property(key: &str) -> Option<(&'static str, &'static str, Shape)> {
         "Keywords" => ("pdf:Keywords", PDF, Shape::Text),
         "Creator" => ("xmp:CreatorTool", XMP, Shape::Text),
         "Producer" => ("pdf:Producer", PDF, Shape::Text),
+        "CreationDate" => ("xmp:CreateDate", XMP, Shape::Text),
+        "ModDate" => ("xmp:ModifyDate", XMP, Shape::Text),
         _ => return None,
     })
 }
@@ -54,21 +77,49 @@ fn property(key: &str) -> Option<(&'static str, &'static str, Shape)> {
 /// that can't be edited safely.
 pub(crate) fn sync_info(doc: &mut Document, key: &str, value: &str) -> Result<(), OrganizeError> {
     let Some((name, ns, shape)) = property(key) else { return Ok(()) };
-    let Some(root) = doc.root() else { return Ok(()) };
+    let iso;
+    let value = if (key == "CreationDate" || key == "ModDate") && !value.is_empty() {
+        iso = iso_date(value).unwrap_or_else(|| value.to_string());
+        &iso
+    } else {
+        value
+    };
+    edit_packet(doc, |xmp| set_property(xmp, name, ns, shape, value)).map(|_| ())
+}
+
+/// Remove every occurrence of the properties `names` from the catalog's XMP packet; whether any
+/// was there.
+pub(crate) fn remove_properties(doc: &mut Document, names: &[&str]) -> Result<bool, OrganizeError> {
+    edit_packet(doc, |xmp| {
+        let mut out: Option<String> = None;
+        for name in names {
+            // Each removal shortens the packet, so this ends.
+            while let Some(next) = set_property(out.as_deref().unwrap_or(xmp), name, "", Shape::Text, "") {
+                out = Some(next);
+            }
+        }
+        out
+    })
+}
+
+/// Rewrite the catalog's XMP packet with `edit` (`None`: unchanged); whether it changed. Files
+/// without XMP and packets that can't be edited safely are left alone.
+fn edit_packet(doc: &mut Document, edit: impl FnOnce(&str) -> Option<String>) -> Result<bool, OrganizeError> {
+    let Some(root) = doc.root() else { return Ok(false) };
     // A metadata stream is always indirect (§7.3.8); anything else is left alone.
-    let Some(r) = doc.get(root).as_dict().and_then(|c| c.reference(b"Metadata")) else { return Ok(()) };
+    let Some(r) = doc.get(root).as_dict().and_then(|c| c.reference(b"Metadata")) else { return Ok(false) };
     let obj = doc.get(r);
-    let Object::Stream(stream) = &*obj else { return Ok(()) };
-    let Ok(bytes) = stream.decoded_within(MAX_XMP) else { return Ok(()) };
-    let Ok(xmp) = String::from_utf8(bytes) else { return Ok(()) };
-    let Some(updated) = set_property(&xmp, name, ns, shape, value) else { return Ok(()) };
+    let Object::Stream(stream) = &*obj else { return Ok(false) };
+    let Ok(bytes) = stream.decoded_within(MAX_XMP) else { return Ok(false) };
+    let Ok(xmp) = String::from_utf8(bytes) else { return Ok(false) };
+    let Some(updated) = edit(&xmp) else { return Ok(false) };
     // Written unfiltered, as PDF/A asks of metadata streams, so other tools can read it.
     let mut dict = stream.dict.clone();
     for k in [&b"Filter"[..], b"DecodeParms", b"DL", b"Length"] {
         dict.remove(k);
     }
     doc.set(r, Object::Stream(Stream::from_raw(dict, updated.into_bytes())));
-    Ok(())
+    Ok(true)
 }
 
 /// `xmp` with the property `name` (namespace `ns`) set to `value`, or removed when `value` is
@@ -151,11 +202,24 @@ fn element_span(xmp: &str, name: &str) -> Option<(usize, usize)> {
 /// start and end of its value, and its quote character. Only matches inside a start tag.
 fn attribute_span(xmp: &str, name: &str) -> Option<(usize, usize, usize, char)> {
     let mut from = 0;
+    // The last `<` and `>` before the match, found by one pass over the packet rather than by
+    // searching back from every match.
+    let (mut scanned, mut last_open, mut last_close) = (0, None, None);
     while let Some(i) = xmp.get(from..).and_then(|s| s.find(name)).map(|i| i + from) {
         from = i + name.len();
         let before = xmp.get(..i)?;
+        let gap = xmp.get(scanned..i)?;
+        #[cfg(test)]
+        crate::work(gap.len());
+        if let Some(at) = gap.rfind('<') {
+            last_open = Some(scanned + at);
+        }
+        if let Some(at) = gap.rfind('>') {
+            last_close = Some(scanned + at);
+        }
+        scanned = i;
         // Preceded by whitespace, and inside a tag (the last `<` comes after the last `>`).
-        if !before.ends_with(char::is_whitespace) || before.rfind('<') < before.rfind('>') || before.rfind('<').is_none() {
+        if !before.ends_with(char::is_whitespace) || last_open < last_close || last_open.is_none() {
             continue;
         }
         let rest = xmp.get(from..)?;
@@ -247,5 +311,19 @@ mod tests {
                 let _ = set_property(packet, "pdf:Keywords", PDF, Shape::Text, value);
             }
         }
+    }
+
+    #[test]
+    fn attribute_search_scans_the_packet_once() {
+        // Thousands of attribute-like words in one text node: none is inside a tag.
+        let packet = format!("<x:xmpmeta><rdf:RDF><rdf:Description>{}</rdf:Description></rdf:RDF></x:xmpmeta>", " rdf:about".repeat(5_000));
+        crate::take_work();
+        assert_eq!(attribute_span(&packet, "rdf:about"), None);
+        let work = crate::take_work();
+        assert!(work <= 2 * packet.len(), "{work} bytes scanned in a {}-byte packet", packet.len());
+        // A real attribute after them is still found.
+        let packet = packet.replace("</rdf:Description>", "</rdf:Description><rdf:Description rdf:about='u'/>");
+        let (_, s, e, q) = attribute_span(&packet, "rdf:about").unwrap();
+        assert_eq!((packet.get(s..e), q), (Some("u"), '\''));
     }
 }

@@ -33,8 +33,8 @@ pub use import::{
 };
 pub use labels::{LabelRange, LabelStyle, PageLabels, number_pages, page_label_ranges, page_labels, set_page_label_ranges};
 pub use outline::{
-    Bookmark, BookmarkPage, OutlineEntry, OutlineError, add_bookmark, add_bookmark_tree, bookmark_page, bookmarks, delete_bookmark, move_bookmark,
-    rename_bookmark, set_bookmark_open, set_bookmark_page, top_level_bookmarks,
+    Bookmark, BookmarkPage, OutlineEntry, OutlineError, add_bookmark, add_bookmark_at, add_bookmark_tree, bookmark_page, bookmarks, delete_bookmark,
+    move_bookmark, rename_bookmark, set_bookmark_color, set_bookmark_open, set_bookmark_page, set_bookmark_style, top_level_bookmarks,
 };
 pub use transition::{TRANSITION_DIRECTIONS, TRANSITION_STYLES, Transition, TransitionSpec, set_transition};
 pub use view::{InitialView, displays_doc_title, initial_view, set_initial_view};
@@ -72,36 +72,74 @@ fn pages_root(doc: &Document) -> Result<ObjRef, OrganizeError> {
 
 /// All leaf pages in order, with their effective inherited attributes.
 fn walk(doc: &Document) -> Result<Vec<(ObjRef, Dict)>, OrganizeError> {
-    let root = pages_root(doc)?;
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    // (node, inherited attributes from ancestors)
-    let mut stack: Vec<(ObjRef, Dict)> = vec![(root, Dict::new())];
-    while let Some((node, inherited)) = stack.pop() {
-        if !seen.insert(node) || seen.len() > 1_000_000 {
-            continue; // cycles in broken trees
-        }
-        let obj = doc.get(node);
-        let Some(d) = obj.as_dict() else { continue };
-        let mut attrs = inherited.clone();
-        for k in INHERITABLE {
-            if let Some(v) = d.get(k) {
-                attrs.set(k.to_vec(), v.clone());
+    Ok(PageWalk::new(doc, pages_root(doc)?).collect())
+}
+
+/// For each of `INHERITABLE`, the nearest node that sets it, shared rather than copied.
+type Owners = [Option<std::sync::Arc<Object>>; 4];
+
+/// Depth-first walk over the leaf pages under `top`. It keeps one cursor per open `/Kids` array,
+/// never one entry per child, and carries inherited attributes as the nodes that set them, so a
+/// child listed many times or shared between nodes is skipped by the seen check before anything
+/// is queued or copied (`pdfcraft_model::pages` walks the same way). Cycles in broken trees end
+/// at the seen check and at most a million nodes are visited.
+struct PageWalk<'a> {
+    doc: &'a Document,
+    seen: std::collections::HashSet<ObjRef>,
+    pending: Vec<(std::sync::Arc<Object>, usize, Owners)>,
+}
+
+impl<'a> PageWalk<'a> {
+    fn new(doc: &'a Document, top: ObjRef) -> Self {
+        let top = std::sync::Arc::new(Object::Array(vec![Object::Ref(top)]));
+        Self { doc, seen: Default::default(), pending: vec![(top, 0, Default::default())] }
+    }
+}
+
+impl Iterator for PageWalk<'_> {
+    type Item = (ObjRef, Dict);
+
+    fn next(&mut self) -> Option<(ObjRef, Dict)> {
+        while let Some((kids, next, inherited)) = self.pending.last_mut() {
+            let Some(kid) = kids.as_array().and_then(|a| a.get(*next)) else {
+                self.pending.pop();
+                continue;
+            };
+            let node = kid.as_ref();
+            *next += 1;
+            let Some(node) = node else { continue };
+            if self.seen.len() >= 1_000_000 {
+                self.pending.clear();
+                return None;
             }
-        }
-        let is_pages = d.name(b"Type") == Some(b"Pages") || (d.contains(b"Kids") && d.name(b"Type") != Some(b"Page"));
-        if is_pages {
-            let kids = d.get(b"Kids").map(|k| doc.resolve(k)).and_then(|k| k.as_array().cloned()).unwrap_or_default();
-            for k in kids.iter().rev() {
-                if let Some(r) = k.as_ref() {
-                    stack.push((r, attrs.clone()));
+            if !self.seen.insert(node) {
+                continue;
+            }
+            let obj = self.doc.get(node);
+            let Some(d) = obj.as_dict() else { continue };
+            let mut owners = inherited.clone();
+            for (k, owner) in INHERITABLE.iter().zip(&mut owners) {
+                if d.contains(k) {
+                    *owner = Some(obj.clone());
                 }
             }
-        } else {
-            out.push((node, attrs));
+            let is_pages = d.name(b"Type") == Some(b"Pages") || (d.contains(b"Kids") && d.name(b"Type") != Some(b"Page"));
+            if is_pages {
+                if let Some(kids) = d.get(b"Kids") {
+                    self.pending.push((self.doc.resolve(kids), 0, owners));
+                }
+            } else {
+                let mut attrs = Dict::new();
+                for (k, owner) in INHERITABLE.iter().zip(&owners) {
+                    if let Some(v) = owner.as_ref().and_then(|o| o.as_dict()).and_then(|o| o.get(k)) {
+                        attrs.set(k.to_vec(), v.clone());
+                    }
+                }
+                return Some((node, attrs));
+            }
         }
+        None
     }
-    Ok(out)
 }
 
 /// Leaf pages in document order.
@@ -216,6 +254,12 @@ pub fn rotate_pages(doc: &mut Document, indices: &[usize], degrees: i64) -> Resu
 }
 
 /// Delete pages. Refuses to delete every page.
+///
+/// # Errors
+///
+/// This operation is not transactional: an error can leave `doc` partially modified. Callers
+/// that need atomic edits (including replacement) must use a working clone and keep it only on
+/// success; discard the working clone on error. The engine does this for its history boundary.
 pub fn delete_pages(doc: &mut Document, indices: &[usize]) -> Result<(), OrganizeError> {
     let all = walk(doc)?;
     check(indices, all.len())?;
@@ -365,43 +409,42 @@ fn prune_legacy(doc: &Document, dests: &mut Dict, gone: &[ObjRef], dead: &mut Ve
 /// Prune a name tree held in `slot` (a reference, or a dictionary written inline). A reference is
 /// updated in place and yields `None`; an inline dictionary that changed is handed back.
 fn prune_tree_slot(doc: &mut Document, slot: &Object, gone: &[ObjRef], dead: &mut Vec<Vec<u8>>) -> Result<Option<Dict>, OrganizeError> {
-    let mut seen = Vec::new();
-    match slot {
+    let mut stack = Vec::new();
+    let inline = match slot {
         Object::Ref(r) => {
-            prune_tree_ref(doc, *r, gone, dead, &mut seen)?;
-            Ok(None)
+            stack.push(*r);
+            None
         }
         Object::Dict(d) => {
             let mut node = d.clone();
-            Ok(prune_tree_node(doc, &mut node, gone, dead, &mut seen)?.then_some(node))
+            prune_tree_node(doc, &mut node, gone, dead, &mut stack).then_some(node)
         }
-        _ => Ok(None),
+        _ => None,
+    };
+    // Name trees consist of shallow indirect nodes: graph depth must not become call-stack
+    // depth. Visit each indirect node once, even when cyclic or shared. Unlike the depth-limited
+    // outline::name_tree lookup, deletion must inspect every reachable node to remove references
+    // to freed pages. Both walks use seen sets to stop cycles.
+    let mut seen = std::collections::HashSet::new();
+    while let Some(r) = stack.pop() {
+        if !seen.insert(r) {
+            continue;
+        }
+        let Some(mut node) = doc.get(r).as_dict().cloned() else { continue };
+        if prune_tree_node(doc, &mut node, gone, dead, &mut stack) {
+            doc.update_dict(r, |d| *d = node)?;
+        }
     }
+    Ok(inline)
 }
 
-fn prune_tree_ref(doc: &mut Document, r: ObjRef, gone: &[ObjRef], dead: &mut Vec<Vec<u8>>, seen: &mut Vec<ObjRef>) -> Result<(), OrganizeError> {
-    if seen.contains(&r) {
-        return Ok(());
-    }
-    seen.push(r);
-    let Some(mut node) = doc.get(r).as_dict().cloned() else { return Ok(()) };
-    if prune_tree_node(doc, &mut node, gone, dead, seen)? {
-        doc.update_dict(r, |d| *d = node)?;
-    }
-    Ok(())
-}
-
-/// Drop the /Names pairs of one name-tree node that go to a `gone` page, then do the same for its
-/// /Kids. True when `node` itself changed (kids held by reference are written back here).
-fn prune_tree_node(
-    doc: &mut Document,
-    node: &mut Dict,
-    gone: &[ObjRef],
-    dead: &mut Vec<Vec<u8>>,
-    seen: &mut Vec<ObjRef>,
-) -> Result<bool, OrganizeError> {
+/// Drop the /Names pairs going to a `gone` page, and queue /Kids for the iterative walk.
+/// True when `node` itself changed; child nodes are written back by the caller.
+fn prune_tree_node(doc: &Document, node: &mut Dict, gone: &[ObjRef], dead: &mut Vec<Vec<u8>>, stack: &mut Vec<ObjRef>) -> bool {
     let mut changed = false;
-    if let Some(pairs) = node.get(b"Names").map(|n| doc.resolve(n)).and_then(|n| n.as_array().cloned()) {
+    if let Some(names) = node.get(b"Names").map(|n| doc.resolve(n))
+        && let Some(pairs) = names.as_array()
+    {
         let mut kept = Vec::with_capacity(pairs.len());
         for pair in pairs.chunks(2) {
             match pair {
@@ -418,13 +461,16 @@ fn prune_tree_node(
             changed = true;
         }
     }
-    let kids = node.get(b"Kids").map(|k| doc.resolve(k)).and_then(|k| k.as_array().cloned()).unwrap_or_default();
-    for kid in kids {
-        if let Some(r) = kid.as_ref() {
-            prune_tree_ref(doc, r, gone, dead, seen)?;
+    if let Some(children) = node.get(b"Kids").map(|k| doc.resolve(k))
+        && let Some(kids) = children.as_array()
+    {
+        for kid in kids.iter().rev() {
+            if let Some(r) = kid.as_ref() {
+                stack.push(r);
+            }
         }
     }
-    Ok(changed)
+    changed
 }
 
 /// Take widgets out of the form: out of their field's /Kids, or out of /AcroForm /Fields when
@@ -562,11 +608,619 @@ pub fn insert_blank_page(doc: &mut Document, at: usize, width: f64, height: f64)
 }
 
 /// Document information keys editable in Document Properties ▸ Description.
-pub const INFO_KEYS: [&str; 4] = ["Title", "Author", "Subject", "Keywords"];
+pub const INFO_KEYS: [&str; 6] = ["Title", "Author", "Subject", "Keywords", "CreationDate", "ModDate"];
 
 /// The document-information entries the spec names (ISO 32000-2 table 349). Any other key in
 /// `/Info` is a custom property (Document Properties ▸ Custom).
 pub const STANDARD_INFO_KEYS: [&str; 9] = ["Title", "Author", "Subject", "Keywords", "Creator", "Producer", "CreationDate", "ModDate", "Trapped"];
+
+/// Canonicalize standard info key names (case-insensitive: "creationdate" -> "CreationDate", "moddate" -> "ModDate").
+pub fn canonical_info_key(key: &str) -> &str {
+    for standard in STANDARD_INFO_KEYS {
+        if standard.eq_ignore_ascii_case(key.trim()) {
+            return standard;
+        }
+    }
+    key
+}
+
+/// Format a PDF date (e.g. `D:20261020161649+03'00'`) into a human-friendly date string:
+/// `10/20/26, 4:16:49 PM`.
+/// Non-date or unparseable strings are returned unchanged.
+pub fn format_pdf_date(s: &str) -> String {
+    let raw = s.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let d = raw.strip_prefix("D:").or_else(|| raw.strip_prefix("d:")).unwrap_or(raw);
+
+    // If it starts with at least 8 digits (YYYYMMDD)
+    let digits: String = d.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() >= 8 {
+        let y: u32 = digits.get(0..4).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let m: u32 = digits.get(4..6).and_then(|v| v.parse().ok()).unwrap_or(1);
+        let day: u32 = digits.get(6..8).and_then(|v| v.parse().ok()).unwrap_or(1);
+        let h: u32 = digits.get(8..10).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let mi: u32 = digits.get(10..12).and_then(|v| v.parse().ok()).unwrap_or(0);
+        let sec: u32 = digits.get(12..14).and_then(|v| v.parse().ok()).unwrap_or(0);
+
+        let year = if (1970..2070).contains(&y) { format!("{:02}", y % 100) } else { format!("{y:04}") };
+        let rest = d.get(digits.len()..).unwrap_or("").trim();
+        let zone = match rest.chars().next() {
+            Some('Z' | 'z') => " Z".to_string(),
+            Some(sign @ ('+' | '-')) => {
+                let t: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+                format!(" {sign}{}:{}", t.get(0..2).unwrap_or("00"), t.get(2..4).unwrap_or("00"))
+            }
+            _ => String::new(),
+        };
+        let (hour_12, ampm) = if h == 0 {
+            (12, "AM")
+        } else if h < 12 {
+            (h, "AM")
+        } else if h == 12 {
+            (12, "PM")
+        } else {
+            (h - 12, "PM")
+        };
+
+        return format!("{m}/{day}/{year}, {hour_12}:{mi:02}:{sec:02} {ampm}{zone}");
+    }
+
+    let norm = normalize_pdf_date(raw);
+    if norm.starts_with("D:") && norm != raw {
+        return format_pdf_date(&norm);
+    }
+
+    raw.to_string()
+}
+
+/// Local timezone offset in seconds east of UTC (0 on WASM or when unknown).
+pub fn local_utc_offset() -> i64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    return i64::from(chrono::Local::now().offset().local_minus_utc());
+    #[cfg(target_arch = "wasm32")]
+    return 0;
+}
+
+fn days_in_month(y: u32, m: u32) -> u32 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let is_leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+            if is_leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
+fn is_valid_tz_offset(offset: &str) -> bool {
+    let Some(sign) = offset.chars().next() else { return false };
+    if sign != '+' && sign != '-' {
+        return false;
+    }
+    let rest = offset.get(1..).unwrap_or("");
+    let b = rest.as_bytes();
+
+    let (h_str, m_str) = if rest.len() == 2 && rest.chars().all(|c| c.is_ascii_digit()) {
+        (rest.get(0..2), None)
+    } else if rest.len() == 4 && rest.chars().all(|c| c.is_ascii_digit()) {
+        (rest.get(0..2), rest.get(2..4))
+    } else if rest.len() == 5 && b.get(2) == Some(&b':') {
+        let (h, m) = (rest.get(0..2), rest.get(3..5));
+        if !h.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) || !m.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) {
+            return false;
+        }
+        (h, m)
+    } else if (rest.len() == 3 || rest.len() == 5 || rest.len() == 6) && b.get(2) == Some(&b'\'') {
+        let h = rest.get(0..2);
+        if !h.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) {
+            return false;
+        }
+        if rest.len() == 3 {
+            (h, None)
+        } else if rest.len() == 5 {
+            let m = rest.get(3..5);
+            if !m.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) {
+                return false;
+            }
+            (h, m)
+        } else if b.get(5) == Some(&b'\'') {
+            let m = rest.get(3..5);
+            if !m.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) {
+                return false;
+            }
+            (h, m)
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    };
+
+    let Some(h) = h_str.and_then(|v| v.parse::<u32>().ok()) else { return false };
+    if h > 23 {
+        return false;
+    }
+    if let Some(m) = m_str.and_then(|v| v.parse::<u32>().ok())
+        && m > 59
+    {
+        return false;
+    }
+    true
+}
+
+/// Validate whether an input string matches an acceptable date format:
+/// - Human 12-hour format: `MM/DD/YY, h:mm:ss AM/PM` (or `MM/DD/YYYY, h:mm:ss AM/PM`)
+/// - ISO format: `YYYY-MM-DD`, `YYYY-MM-DD HH:MM:SS`, `YYYY-MM-DDTHH:MM:SS`
+/// - PDF format: `D:YYYYMMDD...`
+/// - Empty string (which clears the date entry)
+pub fn is_valid_pdf_date_input(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return true;
+    }
+
+    // PDF format: D:YYYYMMDD... or d:YYYYMMDD...
+    if let Some(rest) = s.strip_prefix("D:").or_else(|| s.strip_prefix("d:")) {
+        let rest = rest.trim();
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !matches!(digits.len(), 4 | 6 | 8 | 10 | 12 | 14) {
+            return false;
+        }
+        let tz = rest.get(digits.len()..).unwrap_or("").trim();
+        let tz_ok = match tz.chars().next() {
+            None => true,
+            Some('Z' | 'z') => tz.len() == 1 || tz.get(1..).unwrap_or("").trim_matches(|c| c == '0' || c == '\'').is_empty(),
+            Some('+' | '-') => {
+                let t: String = tz.get(1..).unwrap_or("").chars().filter(|c| *c != '\'').collect();
+                t.chars().all(|c| c.is_ascii_digit())
+                    && matches!(t.len(), 2 | 4)
+                    && t.get(0..2).and_then(|h| h.parse::<u32>().ok()).is_some_and(|h| h <= 23)
+                    && t.get(2..4).is_none_or(|m| m.parse::<u32>().ok().is_some_and(|m| m <= 59))
+            }
+            _ => false,
+        };
+        if !tz_ok {
+            return false;
+        }
+        let Some(y_str) = digits.get(0..4) else { return false };
+        let Ok(y) = y_str.parse::<u32>() else { return false };
+        if y == 0 {
+            return false;
+        }
+        let m = if digits.len() >= 6 {
+            let Some(m_str) = digits.get(4..6) else { return false };
+            let Ok(m) = m_str.parse::<u32>() else { return false };
+            if !(1..=12).contains(&m) {
+                return false;
+            }
+            m
+        } else {
+            1
+        };
+        if digits.len() >= 8 {
+            let Some(d_str) = digits.get(6..8) else { return false };
+            let Ok(d) = d_str.parse::<u32>() else { return false };
+            if d < 1 || d > days_in_month(y, m) {
+                return false;
+            }
+        }
+        if digits.len() >= 10 {
+            let Some(h_str) = digits.get(8..10) else { return false };
+            let Ok(h) = h_str.parse::<u32>() else { return false };
+            if h > 23 {
+                return false;
+            }
+        }
+        if digits.len() >= 12 {
+            let Some(mi_str) = digits.get(10..12) else { return false };
+            let Ok(mi) = mi_str.parse::<u32>() else { return false };
+            if mi > 59 {
+                return false;
+            }
+        }
+        if digits.len() >= 14 {
+            let Some(s_str) = digits.get(12..14) else { return false };
+            let Ok(sec) = s_str.parse::<u32>() else { return false };
+            if sec > 59 {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    let upper = s.to_ascii_uppercase();
+    let is_pm = upper.contains("PM");
+    let is_am = upper.contains("AM");
+
+    // Human M/D/Y format: e.g. 10/20/26, 4:16:49 PM or 10/20/2026, 4:16:49 PM
+    if s.contains('/') {
+        let mut parts = s.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty());
+        let Some(date_part) = parts.next() else { return false };
+        let slash_parts: Vec<&str> = date_part.split('/').collect();
+        if slash_parts.len() != 3 {
+            return false;
+        }
+        let Some(n1_str) = slash_parts.first() else { return false };
+        let Some(n2_str) = slash_parts.get(1) else { return false };
+        let Some(n3_str) = slash_parts.get(2) else { return false };
+        let Ok(n1) = n1_str.parse::<u32>() else { return false };
+        let Ok(n2) = n2_str.parse::<u32>() else { return false };
+        let Ok(n3) = n3_str.parse::<u32>() else { return false };
+
+        let (y, m, d) = if n1_str.len() == 4 {
+            // YYYY/MM/DD
+            if n1 == 0 {
+                return false;
+            }
+            (n1, n2, n3)
+        } else {
+            // MM/DD/YY or MM/DD/YYYY
+            let full_year = if n3_str.len() == 4 {
+                if n3 == 0 {
+                    return false;
+                }
+                n3
+            } else if n3 < 70 {
+                2000u32.saturating_add(n3)
+            } else if n3 < 100 {
+                1900u32.saturating_add(n3)
+            } else {
+                n3
+            };
+            (full_year, n1, n2)
+        };
+
+        if y == 0 || !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+            return false;
+        }
+
+        let mut found_time = false;
+        for part in parts {
+            let upper_part = part.to_ascii_uppercase();
+            if upper_part == "AM" || upper_part == "PM" || upper_part == "Z" {
+                continue;
+            }
+            if part.starts_with('+') || part.starts_with('-') {
+                if !is_valid_tz_offset(part) {
+                    return false;
+                }
+                continue;
+            }
+            let cleaned = part.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+            if cleaned.contains(':') {
+                let time_chunks: Vec<&str> = cleaned.split(':').collect();
+                if time_chunks.len() < 2 || time_chunks.len() > 3 {
+                    return false;
+                }
+                let Some(h_str) = time_chunks.first() else { return false };
+                let Some(m_str) = time_chunks.get(1) else { return false };
+                let Ok(h) = h_str.parse::<u32>() else { return false };
+                let Ok(mi) = m_str.parse::<u32>() else { return false };
+                let sec = if let Some(s_str) = time_chunks.get(2) {
+                    let Ok(s) = s_str.parse::<u32>() else { return false };
+                    s
+                } else {
+                    0
+                };
+
+                if (is_am || is_pm) && !(1..=12).contains(&h) {
+                    return false;
+                }
+                if !is_am && !is_pm && h > 23 {
+                    return false;
+                }
+                if mi > 59 || sec > 59 {
+                    return false;
+                }
+                found_time = true;
+            } else {
+                return false;
+            }
+        }
+
+        if (is_am || is_pm) && !found_time {
+            return false;
+        }
+
+        return true;
+    }
+
+    // ISO format: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
+    if s.contains('-') {
+        let parts: Vec<&str> = s.split(|c: char| c == 'T' || c.is_whitespace()).filter(|p| !p.is_empty()).collect();
+        if let Some(date_part) = parts.first() {
+            let dash_parts: Vec<&str> = date_part.split('-').collect();
+            if dash_parts.len() == 3 {
+                let Some(y_str) = dash_parts.first() else { return false };
+                let Some(m_str) = dash_parts.get(1) else { return false };
+                let Some(d_str) = dash_parts.get(2) else { return false };
+                let Ok(y) = y_str.parse::<u32>() else { return false };
+                let Ok(m) = m_str.parse::<u32>() else { return false };
+                let Ok(d) = d_str.parse::<u32>() else { return false };
+                if y == 0 || !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+                    return false;
+                }
+                if let Some(time_part) = parts.get(1) {
+                    let cleaned = time_part.trim_end_matches(|c: char| c == 'Z' || c == 'z' || c.is_ascii_alphabetic());
+                    let (cleaned, offset) = if let Some(idx) = cleaned.find('+').or_else(|| cleaned.find('-')) {
+                        (cleaned.get(..idx).unwrap_or(cleaned), cleaned.get(idx..))
+                    } else {
+                        (cleaned, None)
+                    };
+                    if let Some(off) = offset
+                        && !is_valid_tz_offset(off)
+                    {
+                        return false;
+                    }
+                    let time_chunks: Vec<&str> = cleaned.split(':').collect();
+                    if !time_chunks.is_empty() {
+                        let Some(h_str) = time_chunks.first() else { return false };
+                        let Ok(h) = h_str.parse::<u32>() else { return false };
+                        if h > 23 {
+                            return false;
+                        }
+                        if let Some(m_str) = time_chunks.get(1) {
+                            let Ok(mi) = m_str.parse::<u32>() else { return false };
+                            if mi > 59 {
+                                return false;
+                            }
+                        }
+                        if let Some(s_str) = time_chunks.get(2) {
+                            let Ok(sec) = s_str.parse::<u32>() else { return false };
+                            if sec > 59 {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+    }
+
+    // Pure digits: at least 4 digits for year, matching valid 2-digit field increments (4, 6, 8, 10, 12, 14)
+    if s.chars().all(|c| c.is_ascii_digit()) && matches!(s.len(), 4 | 6 | 8 | 10 | 12 | 14) {
+        let Some(y_str) = s.get(0..4) else { return false };
+        let Ok(y) = y_str.parse::<u32>() else { return false };
+        if y == 0 {
+            return false;
+        }
+        let m = if s.len() >= 6 {
+            let Some(m_str) = s.get(4..6) else { return false };
+            let Ok(m) = m_str.parse::<u32>() else { return false };
+            if !(1..=12).contains(&m) {
+                return false;
+            }
+            m
+        } else {
+            1
+        };
+        if s.len() >= 8 {
+            let Some(d_str) = s.get(6..8) else { return false };
+            let Ok(d) = d_str.parse::<u32>() else { return false };
+            if d < 1 || d > days_in_month(y, m) {
+                return false;
+            }
+        }
+        if s.len() >= 10 {
+            let Some(h_str) = s.get(8..10) else { return false };
+            let Ok(h) = h_str.parse::<u32>() else { return false };
+            if h > 23 {
+                return false;
+            }
+        }
+        if s.len() >= 12 {
+            let Some(mi_str) = s.get(10..12) else { return false };
+            let Ok(mi) = mi_str.parse::<u32>() else { return false };
+            if mi > 59 {
+                return false;
+            }
+        }
+        if s.len() >= 14 {
+            let Some(s_str) = s.get(12..14) else { return false };
+            let Ok(sec) = s_str.parse::<u32>() else { return false };
+            if sec > 59 {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Suffix for a PDF date with an explicit offset in seconds east of UTC (e.g. `+03'00'` or `Z`).
+pub fn tz_suffix(offset: i64) -> String {
+    if offset == 0 {
+        return "Z".to_string();
+    }
+    let sign = if offset < 0 { '-' } else { '+' };
+    let total_mins = offset.unsigned_abs() / 60;
+    let h = total_mins / 60;
+    let m = total_mins % 60;
+    format!("{sign}{h:02}'{m:02}'")
+}
+
+/// Suffix for a PDF date in the local timezone (e.g. `+03'00'` or `Z`).
+pub fn local_tz_suffix() -> String {
+    tz_suffix(local_utc_offset())
+}
+
+/// Normalize a human date, ISO date, or PDF date string into standard PDF date format `D:YYYYMMDDHHmmSS...`.
+///
+/// Accepts:
+/// - Human-friendly 12-hour format (`10/20/26, 4:16:49 PM`, `10/20/2026, 4:16:49 PM`)
+/// - Already-formatted PDF date strings (`D:...` or `d:...`)
+/// - ISO 8601 strings (`2024-01-05T09:30:00Z`, `2024-01-05T09:30:00+01:00`)
+/// - Common human formats (`2024-01-05 09:30:00`, `2024-01-05`, `2024/01/05`)
+///
+/// Empty strings return empty (removing the entry).
+pub fn normalize_pdf_date(s: &str) -> String {
+    normalize_pdf_date_with(s, local_utc_offset())
+}
+
+/// Normalize a date string with an explicit timezone offset in seconds east of UTC.
+pub fn normalize_pdf_date_with_offset(s: &str, offset_secs: i64) -> String {
+    normalize_pdf_date_with(s, offset_secs)
+}
+
+/// Normalize a date string with an explicit timezone offset in seconds east of UTC.
+pub fn normalize_pdf_date_with(s: &str, offset_secs: i64) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    if s.starts_with("D:") || s.starts_with("d:") {
+        return format!("D:{}", s[2..].trim());
+    }
+
+    let upper = s.to_ascii_uppercase();
+    let is_pm = upper.contains("PM");
+    let is_am = upper.contains("AM");
+
+    // Handle M/D/Y formats (e.g. 10/20/26, 4:16:49 PM or 10/20/2026, 4:16:49 PM)
+    if s.contains('/') {
+        let mut parts = s.split(|c: char| c == ',' || c.is_whitespace()).filter(|p| !p.is_empty());
+        if let Some(date_part) = parts.next() {
+            let slash_parts: Vec<&str> = date_part.split('/').collect();
+            if slash_parts.len() == 3 {
+                let n1: u32 = slash_parts[0].parse().unwrap_or(0);
+                let n2: u32 = slash_parts[1].parse().unwrap_or(0);
+                let n3: u32 = slash_parts[2].parse().unwrap_or(0);
+
+                let (y, m, d) = if slash_parts[0].len() == 4 {
+                    (n1, n2.clamp(1, 12), n3.clamp(1, 31))
+                } else {
+                    let full_year = if slash_parts.get(2).is_some_and(|s| s.len() == 4) {
+                        n3
+                    } else if n3 < 70 {
+                        2000 + n3
+                    } else if n3 < 100 {
+                        1900 + n3
+                    } else {
+                        n3
+                    };
+                    (full_year, n1.clamp(1, 12), n2.clamp(1, 31))
+                };
+                if y == 0 {
+                    return String::new();
+                }
+
+                let mut h = 0u32;
+                let mut mi = 0u32;
+                let mut sec = 0u32;
+                let mut tz_part = "";
+
+                for part in parts {
+                    if part == "Z" || part == "z" {
+                        tz_part = "Z";
+                    } else if (part.starts_with('+') || part.starts_with('-')) && part.len() >= 3 {
+                        tz_part = part;
+                    } else {
+                        let cleaned = part.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+                        if cleaned.contains(':') {
+                            let time_chunks: Vec<&str> = cleaned.split(':').collect();
+                            if let Some(h_str) = time_chunks.first() {
+                                h = h_str.parse().unwrap_or(0);
+                            }
+                            if let Some(m_str) = time_chunks.get(1) {
+                                mi = m_str.parse().unwrap_or(0);
+                            }
+                            if let Some(s_str) = time_chunks.get(2) {
+                                sec = s_str.parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+
+                if is_pm {
+                    if h < 12 {
+                        h += 12;
+                    }
+                } else if is_am && h == 12 {
+                    h = 0;
+                }
+                let h = h.clamp(0, 23);
+                let mi = mi.clamp(0, 59);
+                let sec = sec.clamp(0, 59);
+
+                let tz = if tz_part.eq_ignore_ascii_case("Z") {
+                    "Z".to_string()
+                } else if !tz_part.is_empty() {
+                    let sign = tz_part.chars().next().unwrap_or('+');
+                    let tz_digits: String = tz_part.chars().filter(|c| c.is_ascii_digit()).collect();
+                    let th = tz_digits.get(0..2).unwrap_or("00");
+                    let tm = tz_digits.get(2..4).unwrap_or("00");
+                    format!("{sign}{th}'{tm}'")
+                } else {
+                    tz_suffix(offset_secs)
+                };
+
+                return format!("D:{y:04}{m:02}{d:02}{h:02}{mi:02}{sec:02}{tz}");
+            }
+        }
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut tz_part = "";
+    for (i, c) in s.char_indices() {
+        if c.is_ascii_digit() {
+            current.push(c);
+        } else {
+            if !current.is_empty() {
+                chunks.push(std::mem::take(&mut current));
+            }
+            if c == 'Z' || c == 'z' {
+                tz_part = "Z";
+                break;
+            } else if (c == '+' || c == '-') && chunks.len() >= 3 && (s.contains(':') || s.contains('T') || s.contains(' ')) {
+                tz_part = &s[i..];
+                break;
+            }
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    if let Some(year_str) = chunks.first()
+        && year_str.len() == 4
+    {
+        let y: u32 = year_str.parse().unwrap_or(0);
+        let m: u32 = chunks.get(1).and_then(|c| c.parse().ok()).unwrap_or(1).clamp(1, 12);
+        let d: u32 = chunks.get(2).and_then(|c| c.parse().ok()).unwrap_or(1).clamp(1, 31);
+        let mut h: u32 = chunks.get(3).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let mi: u32 = chunks.get(4).and_then(|c| c.parse().ok()).unwrap_or(0).clamp(0, 59);
+        let sec: u32 = chunks.get(5).and_then(|c| c.parse().ok()).unwrap_or(0).clamp(0, 59);
+
+        if is_pm && h < 12 {
+            h += 12;
+        } else if is_am && h == 12 {
+            h = 0;
+        }
+        let h = h.clamp(0, 23);
+
+        let tz = if tz_part.eq_ignore_ascii_case("Z") {
+            "Z".to_string()
+        } else if !tz_part.is_empty() {
+            let sign = tz_part.chars().next().unwrap_or('+');
+            let tz_digits: String = tz_part.chars().filter(|c| c.is_ascii_digit()).collect();
+            let th = tz_digits.get(0..2).unwrap_or("00");
+            let tm = tz_digits.get(2..4).unwrap_or("00");
+            format!("{sign}{th}'{tm}'")
+        } else {
+            tz_suffix(offset_secs)
+        };
+
+        return format!("D:{y:04}{m:02}{d:02}{h:02}{mi:02}{sec:02}{tz}");
+    }
+
+    if s.chars().all(|c| c.is_ascii_digit()) && s.len() >= 4 { format!("D:{s}") } else { s.to_string() }
+}
 
 /// Longest custom property name accepted, in bytes: the name length every reader is asked to
 /// accept (§7.3.5, Annex C).
@@ -614,6 +1268,7 @@ pub fn check_custom_key(name: &str) -> Result<(), OrganizeError> {
 
 /// Read a document-information entry as text.
 pub fn info(doc: &Document, key: &str) -> Option<String> {
+    let key = canonical_info_key(key);
     let info = doc.trailer().get(b"Info").map(|o| doc.resolve(o))?;
     info.as_dict()?.get(key.as_bytes()).and_then(|v| doc.resolve(v).as_string().map(|s| s.to_text()))
 }
@@ -624,13 +1279,27 @@ pub fn info(doc: &Document, key: &str) -> Option<String> {
 /// in the XMP packet, and viewers that read XMP first show its value: the packet's property is
 /// changed (or removed) to match (see `xmp`).
 pub fn set_info(doc: &mut Document, key: &str, value: &str) -> Result<(), OrganizeError> {
+    set_info_with_offset(doc, key, value, local_utc_offset())
+}
+
+/// Set (or clear, with an empty value) a document-information entry with an explicit timezone offset.
+pub fn set_info_with_offset(doc: &mut Document, key: &str, value: &str, offset_secs: i64) -> Result<(), OrganizeError> {
+    let key = canonical_info_key(key);
     if !STANDARD_INFO_KEYS.contains(&key) {
         check_custom_key(key)?;
     }
     let value = value.trim();
-    let entry = (!value.is_empty()).then(|| Object::String(PdfString::text(value)));
+    let value = if key == "CreationDate" || key == "ModDate" {
+        if !is_valid_pdf_date_input(value) {
+            return Err(OrganizeError::Invalid(format!("invalid date format: expected MM/DD/YY, h:mm:ss AM/PM, got '{value}'")));
+        }
+        normalize_pdf_date_with(value, offset_secs)
+    } else {
+        value.to_string()
+    };
+    let entry = (!value.is_empty()).then(|| Object::String(PdfString::text(&value)));
     set_info_entry(doc, key.as_bytes(), entry)?;
-    xmp::sync_info(doc, key, value)
+    xmp::sync_info(doc, key, &value)
 }
 
 /// Set (or remove, with `None`) a document-information entry of any type.
@@ -656,6 +1325,60 @@ fn set_info_entry(doc: &mut Document, key: &[u8], entry: Option<Object>) -> Resu
         }
     }
     Ok(())
+}
+
+/// A standard a document can declare it meets, for [`remove_standard_id`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standard {
+    PdfA,
+    PdfX,
+}
+
+impl Standard {
+    pub fn label(self) -> &'static str {
+        match self {
+            Standard::PdfA => "PDF/A",
+            Standard::PdfX => "PDF/X",
+        }
+    }
+}
+
+/// Remove what identifies the document as meeting `standard`: the `pdfaid:` XMP properties of
+/// ISO 19005, or ISO 15930's `GTS_PDFXVersion` and `GTS_PDFXConformance` in the document
+/// information and as `pdfxid:` XMP properties. Output intents and other metadata stay. Refused
+/// when the document declares nothing of the kind.
+pub fn remove_standard_id(doc: &mut Document, standard: Standard) -> Result<(), OrganizeError> {
+    let (props, info_keys): (&[&str], &[&str]) = match standard {
+        Standard::PdfA => (&["pdfaid:part", "pdfaid:conformance", "pdfaid:amd", "pdfaid:rev"], &[]),
+        Standard::PdfX => (&["pdfxid:GTS_PDFXVersion", "pdfxid:GTS_PDFXConformance"], &["GTS_PDFXVersion", "GTS_PDFXConformance"]),
+    };
+    let mut removed = xmp::remove_properties(doc, props)?;
+    for key in info_keys {
+        if info(doc, key).is_some() {
+            set_info_entry(doc, key.as_bytes(), None)?;
+            removed = true;
+        }
+    }
+    if removed { Ok(()) } else { Err(OrganizeError::Invalid(format!("the document doesn't declare {}", standard.label()))) }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Steps taken on this thread by loops whose cost follows the input's shape, so a test can
+    /// bound the work a hostile document causes without timing it.
+    static WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `n` steps of input-shaped work (see [`WORK`]).
+#[cfg(test)]
+fn work(n: usize) {
+    WORK.with(|w| w.set(w.get().saturating_add(n)));
+}
+
+/// The steps counted on this thread since the last call.
+#[cfg(test)]
+fn take_work() -> usize {
+    WORK.with(|w| w.replace(0))
 }
 
 #[cfg(test)]
