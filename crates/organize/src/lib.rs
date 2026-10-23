@@ -644,7 +644,16 @@ pub fn format_pdf_date(s: &str) -> String {
         let mi: u32 = digits.get(10..12).and_then(|v| v.parse().ok()).unwrap_or(0);
         let sec: u32 = digits.get(12..14).and_then(|v| v.parse().ok()).unwrap_or(0);
 
-        let yy = y % 100;
+        let year = if (1970..2070).contains(&y) { format!("{:02}", y % 100) } else { format!("{y:04}") };
+        let rest = d.get(digits.len()..).unwrap_or("").trim();
+        let zone = match rest.chars().next() {
+            Some('Z' | 'z') => " Z".to_string(),
+            Some(sign @ ('+' | '-')) => {
+                let t: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+                format!(" {sign}{}:{}", t.get(0..2).unwrap_or("00"), t.get(2..4).unwrap_or("00"))
+            }
+            _ => String::new(),
+        };
         let (hour_12, ampm) = if h == 0 {
             (12, "AM")
         } else if h < 12 {
@@ -655,7 +664,7 @@ pub fn format_pdf_date(s: &str) -> String {
             (h - 12, "PM")
         };
 
-        return format!("{m}/{day}/{yy:02}, {hour_12}:{mi:02}:{sec:02} {ampm}");
+        return format!("{m}/{day}/{year}, {hour_12}:{mi:02}:{sec:02} {ampm}{zone}");
     }
 
     let norm = normalize_pdf_date(raw);
@@ -701,7 +710,23 @@ pub fn is_valid_pdf_date_input(s: &str) -> bool {
     if let Some(rest) = s.strip_prefix("D:").or_else(|| s.strip_prefix("d:")) {
         let rest = rest.trim();
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.len() < 4 {
+        if !matches!(digits.len(), 4 | 6 | 8 | 10 | 12 | 14) {
+            return false;
+        }
+        let tz = rest.get(digits.len()..).unwrap_or("").trim();
+        let tz_ok = match tz.chars().next() {
+            None => true,
+            Some('Z' | 'z') => tz.len() == 1 || tz.get(1..).unwrap_or("").trim_matches(|c| c == '0' || c == '\'').is_empty(),
+            Some('+' | '-') => {
+                let t: String = tz.get(1..).unwrap_or("").chars().filter(|c| *c != '\'').collect();
+                t.chars().all(|c| c.is_ascii_digit())
+                    && matches!(t.len(), 2 | 4)
+                    && t.get(0..2).and_then(|h| h.parse::<u32>().ok()).is_some_and(|h| h <= 23)
+                    && t.get(2..4).is_none_or(|m| m.parse::<u32>().ok().is_some_and(|m| m <= 59))
+            }
+            _ => false,
+        };
+        if !tz_ok {
             return false;
         }
         let Some(y_str) = digits.get(0..4) else { return false };

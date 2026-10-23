@@ -278,7 +278,7 @@ fn uses_scripts(edit: &Edit) -> bool {
 
 fn sets_mod_date(edit: &Edit) -> bool {
     match edit {
-        Edit::SetInfo { key, .. } => key.eq_ignore_ascii_case("ModDate"),
+        Edit::SetInfo { key, .. } => pdfcraft_organize::canonical_info_key(key) == "ModDate",
         Edit::Batch { edits, .. } => edits.iter().any(sets_mod_date),
         _ => false,
     }
@@ -2089,7 +2089,7 @@ impl Edit {
             Edit::SetTransition { .. } => Label::of("Set page transitions"),
             // The four `/Info` keys PdfCraft itself offers get a wording of their own, so each can
             // be said in another language; any other key is the document's and goes in as it stands.
-            Edit::SetInfo { key, .. } => match key.as_str() {
+            Edit::SetInfo { key, .. } => match pdfcraft_organize::canonical_info_key(key) {
                 "Title" => Label::of("Change Title"),
                 "Author" => Label::of("Change Author"),
                 "Subject" => Label::of("Change Subject"),

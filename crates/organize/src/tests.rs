@@ -661,7 +661,7 @@ fn format_pdf_date_formats_and_normalizes_correctly() {
     use crate::{format_pdf_date, normalize_pdf_date};
 
     // User's exact case:
-    assert_eq!(format_pdf_date("D:20261020161649+03'00'"), "10/20/26, 4:16:49 PM");
+    assert_eq!(format_pdf_date("D:20261020161649+03'00'"), "10/20/26, 4:16:49 PM +03:00");
     let local_suffix = crate::local_tz_suffix();
     assert_eq!(normalize_pdf_date("10/20/26, 4:16:49 PM"), format!("D:20261020161649{local_suffix}"));
     assert_eq!(normalize_pdf_date("10/20/26, 4:16:49\u{202f}PM"), format!("D:20261020161649{local_suffix}"));
@@ -669,19 +669,25 @@ fn format_pdf_date_formats_and_normalizes_correctly() {
     assert_eq!(normalize_pdf_date("10/20/26, 4:16:49 PM +03:00"), "D:20261020161649+03'00'");
 
     // Morning and midnight/noon cases
-    assert_eq!(format_pdf_date("D:20240508090503Z"), "5/8/24, 9:05:03 AM");
+    assert_eq!(format_pdf_date("D:20240508090503Z"), "5/8/24, 9:05:03 AM Z");
     assert_eq!(normalize_pdf_date("5/8/24, 9:05:03 AM Z"), "D:20240508090503Z");
-    assert_eq!(format_pdf_date("D:20240101000000Z"), "1/1/24, 12:00:00 AM");
+    assert_eq!(format_pdf_date("D:20240101000000Z"), "1/1/24, 12:00:00 AM Z");
     assert_eq!(normalize_pdf_date("1/1/24, 12:00:00 AM Z"), "D:20240101000000Z");
-    assert_eq!(format_pdf_date("D:20240101120000Z"), "1/1/24, 12:00:00 PM");
+    assert_eq!(format_pdf_date("D:20240101120000Z"), "1/1/24, 12:00:00 PM Z");
     assert_eq!(normalize_pdf_date("1/1/24, 12:00:00 PM Z"), "D:20240101120000Z");
+
+    // Year outside 1970..2070 preserved as 4 digits
+    assert_eq!(format_pdf_date("D:19650101120000Z"), "1/1/1965, 12:00:00 PM Z");
+    assert_eq!(format_pdf_date("D:20750101120000Z"), "1/1/2075, 12:00:00 PM Z");
+
+    // Without timezone suffix
+    assert_eq!(format_pdf_date("D:20261020161649"), "10/20/26, 4:16:49 PM");
 
     // 4-digit year format
     assert_eq!(normalize_pdf_date("10/20/2026, 4:16:49 PM Z"), "D:20261020161649Z");
 
     // ISO format
-    assert_eq!(format_pdf_date("2026-10-20T16:16:49Z"), "10/20/26, 4:16:49 PM");
-    assert_eq!(format_pdf_date("2026-10-20 16:16:49"), "10/20/26, 4:16:49 PM");
+    assert_eq!(format_pdf_date("2026-10-20T16:16:49Z"), "10/20/26, 4:16:49 PM Z");
 
     // Explicit timezone offset:
     assert_eq!(crate::normalize_pdf_date_with("10/20/26, 4:16:49 PM", 0), "D:20261020161649Z");
@@ -711,6 +717,9 @@ fn is_valid_pdf_date_input_checks_pattern_correctly() {
     assert!(is_valid_pdf_date_input("2026-10-20T16:16:49Z"));
     assert!(is_valid_pdf_date_input("D:20261020161649+03'00'"));
     assert!(is_valid_pdf_date_input("D:20261020161649Z"));
+    assert!(is_valid_pdf_date_input("D:2026"));
+    assert!(is_valid_pdf_date_input("D:202610"));
+    assert!(is_valid_pdf_date_input("D:20261020"));
 
     // Invalid formats:
     assert!(!is_valid_pdf_date_input("not-a-date"));
@@ -727,6 +736,12 @@ fn is_valid_pdf_date_input_checks_pattern_correctly() {
     assert!(!is_valid_pdf_date_input("10/20/26, 4:16:49 XM")); // invalid AM/PM
     assert!(!is_valid_pdf_date_input("D:invalid"));
     assert!(!is_valid_pdf_date_input("D:20261301")); // month 13 in PDF date
+    assert!(!is_valid_pdf_date_input("D:20261")); // 5 digits (partial)
+    assert!(!is_valid_pdf_date_input("D:202610201")); // 9 digits (partial)
+    assert!(!is_valid_pdf_date_input("D:2026 hello")); // trailing text
+    assert!(!is_valid_pdf_date_input("D:20261020xyz")); // trailing text
+    assert!(!is_valid_pdf_date_input("D:20261020161649+99'99'")); // invalid offset hour
+    assert!(!is_valid_pdf_date_input("D:20261020161649+03'60'")); // invalid offset minute
 
     // set_info rejects invalid date format with error:
     let mut doc = open(fixture());
