@@ -701,15 +701,49 @@ fn is_valid_tz_offset(offset: &str) -> bool {
         return false;
     }
     let rest = offset.get(1..).unwrap_or("");
-    let digits: String = rest.chars().filter(|c| *c != ':' && *c != '\'').collect();
-    if !digits.chars().all(|c| c.is_ascii_digit()) || !matches!(digits.len(), 2 | 4) {
+    let b = rest.as_bytes();
+
+    let (h_str, m_str) = if rest.len() == 2 && rest.chars().all(|c| c.is_ascii_digit()) {
+        (rest.get(0..2), None)
+    } else if rest.len() == 4 && rest.chars().all(|c| c.is_ascii_digit()) {
+        (rest.get(0..2), rest.get(2..4))
+    } else if rest.len() == 5 && b.get(2) == Some(&b':') {
+        let (h, m) = (rest.get(0..2), rest.get(3..5));
+        if !h.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) || !m.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) {
+            return false;
+        }
+        (h, m)
+    } else if (rest.len() == 3 || rest.len() == 5 || rest.len() == 6) && b.get(2) == Some(&b'\'') {
+        let h = rest.get(0..2);
+        if !h.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) {
+            return false;
+        }
+        if rest.len() == 3 {
+            (h, None)
+        } else if rest.len() == 5 {
+            let m = rest.get(3..5);
+            if !m.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) {
+                return false;
+            }
+            (h, m)
+        } else if b.get(5) == Some(&b'\'') {
+            let m = rest.get(3..5);
+            if !m.is_some_and(|s| s.chars().all(|c| c.is_ascii_digit())) {
+                return false;
+            }
+            (h, m)
+        } else {
+            return false;
+        }
+    } else {
         return false;
-    }
-    let Some(h) = digits.get(0..2).and_then(|v| v.parse::<u32>().ok()) else { return false };
+    };
+
+    let Some(h) = h_str.and_then(|v| v.parse::<u32>().ok()) else { return false };
     if h > 23 {
         return false;
     }
-    if let Some(m) = digits.get(2..4).and_then(|v| v.parse::<u32>().ok())
+    if let Some(m) = m_str.and_then(|v| v.parse::<u32>().ok())
         && m > 59
     {
         return false;
@@ -825,6 +859,9 @@ pub fn is_valid_pdf_date_input(s: &str) -> bool {
         } else {
             // MM/DD/YY or MM/DD/YYYY
             let full_year = if n3_str.len() == 4 {
+                if n3 == 0 {
+                    return false;
+                }
                 n3
             } else if n3 < 70 {
                 2000u32.saturating_add(n3)
@@ -836,7 +873,7 @@ pub fn is_valid_pdf_date_input(s: &str) -> bool {
             (full_year, n1, n2)
         };
 
-        if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
+        if y == 0 || !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
             return false;
         }
 
@@ -1068,6 +1105,9 @@ pub fn normalize_pdf_date_with(s: &str, offset_secs: i64) -> String {
                     };
                     (full_year, n1.clamp(1, 12), n2.clamp(1, 31))
                 };
+                if y == 0 {
+                    return String::new();
+                }
 
                 let mut h = 0u32;
                 let mut mi = 0u32;
